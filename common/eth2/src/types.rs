@@ -1,14 +1,22 @@
 //! This module exposes a superset of the `types` crate. It adds additional types that are only
 //! required for the HTTP API.
 
-use crate::Error as ServerError;
+use crate::{
+    Error as ServerError, CONSENSUS_BLOCK_VALUE_HEADER, CONSENSUS_VERSION_HEADER,
+    EXECUTION_PAYLOAD_BLINDED_HEADER, EXECUTION_PAYLOAD_VALUE_HEADER,
+};
 use lighthouse_network::{ConnectionDirection, Enr, Multiaddr, PeerConnectionStatus};
 use mediatype::{names, MediaType, MediaTypeList};
-use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
+use reqwest::header::HeaderMap;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+use ssz::{Decode, DecodeError};
+use ssz_derive::{Decode, Encode};
 use std::fmt::{self, Display};
 use std::str::{from_utf8, FromStr};
+use std::sync::Arc;
 use std::time::Duration;
+use types::beacon_block_body::KzgCommitments;
 pub use types::*;
 
 #[cfg(feature = "lighthouse")]
@@ -273,18 +281,19 @@ pub struct FinalityCheckpointsData {
     pub finalized: Checkpoint,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "&str")]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(into = "String")]
+#[serde(try_from = "std::borrow::Cow<str>")]
 pub enum ValidatorId {
     PublicKey(PublicKeyBytes),
     Index(u64),
 }
 
-impl TryFrom<&str> for ValidatorId {
+impl TryFrom<std::borrow::Cow<'_, str>> for ValidatorId {
     type Error = String;
 
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        Self::from_str(s)
+    fn try_from(s: std::borrow::Cow<str>) -> Result<Self, Self::Error> {
+        Self::from_str(&s)
     }
 }
 
@@ -310,6 +319,12 @@ impl fmt::Display for ValidatorId {
             ValidatorId::PublicKey(pubkey) => write!(f, "{:?}", pubkey),
             ValidatorId::Index(index) => write!(f, "{}", index),
         }
+    }
+}
+
+impl From<ValidatorId> for String {
+    fn from(id: ValidatorId) -> String {
+        id.to_string()
     }
 }
 
@@ -488,6 +503,15 @@ pub struct ValidatorsQuery {
     pub status: Option<Vec<ValidatorStatus>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatorsRequestBody {
+    #[serde(default)]
+    pub ids: Option<Vec<ValidatorId>>,
+    #[serde(default)]
+    pub statuses: Option<Vec<ValidatorStatus>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommitteeData {
     #[serde(with = "serde_utils::quoted_u64")]
@@ -539,6 +563,7 @@ pub struct BlockHeaderData {
 pub struct DepositContractData {
     #[serde(with = "serde_utils::quoted_u64")]
     pub chain_id: u64,
+    #[serde(with = "serde_utils::address_hex")]
     pub address: Address,
 }
 
@@ -575,8 +600,8 @@ pub struct VersionData {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncingData {
     pub is_syncing: bool,
-    pub is_optimistic: Option<bool>,
-    pub el_offline: Option<bool>,
+    pub is_optimistic: bool,
+    pub el_offline: bool,
     pub head_slot: Slot,
     pub sync_distance: Slot,
 }
@@ -654,6 +679,19 @@ pub struct ValidatorBalancesQuery {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct ValidatorBalancesRequestBody {
+    pub ids: Vec<ValidatorId>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobIndicesQuery {
+    #[serde(default, deserialize_with = "option_query_vec")]
+    pub indices: Option<Vec<u64>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ValidatorIndexData(#[serde(with = "serde_utils::quoted_u64_vec")] pub Vec<u64>);
 
 /// Borrowed variant of `ValidatorIndexData`, for serializing/sending.
@@ -679,6 +717,21 @@ pub struct AttesterData {
     pub slot: Slot,
 }
 
+impl AttesterData {
+    pub fn match_attestation_data<E: EthSpec>(
+        &self,
+        attestation_data: &AttestationData,
+        spec: &ChainSpec,
+    ) -> bool {
+        if spec.fork_name_at_slot::<E>(attestation_data.slot) < ForkName::Electra {
+            self.slot == attestation_data.slot && self.committee_index == attestation_data.index
+        } else {
+            // After electra `attestation_data.index` is set to 0 and does not match the duties
+            self.slot == attestation_data.slot
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProposerData {
     pub pubkey: PublicKeyBytes,
@@ -692,6 +745,7 @@ pub struct ValidatorBlocksQuery {
     pub randao_reveal: SignatureBytes,
     pub graffiti: Option<Graffiti>,
     pub skip_randao_verification: SkipRandaoVerification,
+    pub builder_boost_factor: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -727,6 +781,26 @@ pub struct ValidatorAttestationDataQuery {
 pub struct ValidatorAggregateAttestationQuery {
     pub attestation_data_root: Hash256,
     pub slot: Slot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committee_index: Option<CommitteeIndex>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct LightClientUpdatesQuery {
+    pub start_period: u64,
+    pub count: u64,
+}
+
+#[derive(Encode, Decode)]
+pub struct LightClientUpdateSszResponse {
+    pub response_chunk_len: Vec<u8>,
+    pub response_chunk: Vec<u8>,
+}
+
+#[derive(Encode, Decode)]
+pub struct LightClientUpdateResponseChunk {
+    pub context: [u8; 4],
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -876,6 +950,28 @@ pub struct SseBlock {
 }
 
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone)]
+pub struct SseBlobSidecar {
+    pub block_root: Hash256,
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub index: u64,
+    pub slot: Slot,
+    pub kzg_commitment: KzgCommitment,
+    pub versioned_hash: VersionedHash,
+}
+
+impl SseBlobSidecar {
+    pub fn from_blob_sidecar<E: EthSpec>(blob_sidecar: &BlobSidecar<E>) -> SseBlobSidecar {
+        SseBlobSidecar {
+            block_root: blob_sidecar.block_root(),
+            index: blob_sidecar.index,
+            slot: blob_sidecar.slot(),
+            kzg_commitment: blob_sidecar.kzg_commitment,
+            versioned_hash: blob_sidecar.kzg_commitment.calculate_versioned_hash(),
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Serialize, Deserialize, Clone)]
 pub struct SseFinalizedCheckpoint {
     pub block: Hash256,
     pub state: Hash256,
@@ -894,6 +990,11 @@ pub struct SseHead {
     pub execution_optimistic: bool,
 }
 
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct BlockGossip {
+    pub slot: Slot,
+    pub block: Hash256,
+}
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone)]
 pub struct SseChainReorg {
     pub slot: Slot,
@@ -923,7 +1024,7 @@ pub struct SseLateHead {
 }
 
 #[superstruct(
-    variants(V1, V2),
+    variants(V1, V2, V3),
     variant_attributes(derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize))
 )]
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
@@ -935,9 +1036,12 @@ pub struct SsePayloadAttributes {
     #[superstruct(getter(copy))]
     pub prev_randao: Hash256,
     #[superstruct(getter(copy))]
+    #[serde(with = "serde_utils::address_hex")]
     pub suggested_fee_recipient: Address,
-    #[superstruct(only(V2))]
+    #[superstruct(only(V2, V3))]
     pub withdrawals: Vec<Withdrawal>,
+    #[superstruct(only(V3), partial_getter(copy))]
+    pub parent_beacon_block_root: Hash256,
 }
 
 #[derive(PartialEq, Debug, Deserialize, Serialize, Clone)]
@@ -948,6 +1052,7 @@ pub struct SseExtendedPayloadAttributesGeneric<T> {
     pub parent_block_root: Hash256,
     #[serde(with = "serde_utils::quoted_u64")]
     pub parent_block_number: u64,
+
     pub parent_block_hash: ExecutionBlockHash,
     pub payload_attributes: T,
 }
@@ -961,11 +1066,17 @@ impl ForkVersionDeserialize for SsePayloadAttributes {
         fork_name: ForkName,
     ) -> Result<Self, D::Error> {
         match fork_name {
-            ForkName::Merge => serde_json::from_value(value)
+            ForkName::Bellatrix => serde_json::from_value(value)
                 .map(Self::V1)
                 .map_err(serde::de::Error::custom),
             ForkName::Capella => serde_json::from_value(value)
                 .map(Self::V2)
+                .map_err(serde::de::Error::custom),
+            ForkName::Deneb => serde_json::from_value(value)
+                .map(Self::V3)
+                .map_err(serde::de::Error::custom),
+            ForkName::Electra => serde_json::from_value(value)
+                .map(Self::V3)
                 .map_err(serde::de::Error::custom),
             ForkName::Base | ForkName::Altair => Err(serde::de::Error::custom(format!(
                 "SsePayloadAttributes deserialization for {fork_name} not implemented"
@@ -996,26 +1107,34 @@ impl ForkVersionDeserialize for SseExtendedPayloadAttributes {
 }
 
 #[derive(PartialEq, Debug, Serialize, Clone)]
-#[serde(bound = "T: EthSpec", untagged)]
-pub enum EventKind<T: EthSpec> {
-    Attestation(Box<Attestation<T>>),
+#[serde(bound = "E: EthSpec", untagged)]
+pub enum EventKind<E: EthSpec> {
+    Attestation(Box<Attestation<E>>),
     Block(SseBlock),
+    BlobSidecar(SseBlobSidecar),
     FinalizedCheckpoint(SseFinalizedCheckpoint),
     Head(SseHead),
     VoluntaryExit(SignedVoluntaryExit),
     ChainReorg(SseChainReorg),
-    ContributionAndProof(Box<SignedContributionAndProof<T>>),
+    ContributionAndProof(Box<SignedContributionAndProof<E>>),
     LateHead(SseLateHead),
+    LightClientFinalityUpdate(Box<LightClientFinalityUpdate<E>>),
+    LightClientOptimisticUpdate(Box<LightClientOptimisticUpdate<E>>),
     #[cfg(feature = "lighthouse")]
     BlockReward(BlockReward),
     PayloadAttributes(VersionedSsePayloadAttributes),
+    ProposerSlashing(Box<ProposerSlashing>),
+    AttesterSlashing(Box<AttesterSlashing<E>>),
+    BlsToExecutionChange(Box<SignedBlsToExecutionChange>),
+    BlockGossip(Box<BlockGossip>),
 }
 
-impl<T: EthSpec> EventKind<T> {
+impl<E: EthSpec> EventKind<E> {
     pub fn topic_name(&self) -> &str {
         match self {
             EventKind::Head(_) => "head",
             EventKind::Block(_) => "block",
+            EventKind::BlobSidecar(_) => "blob_sidecar",
             EventKind::Attestation(_) => "attestation",
             EventKind::VoluntaryExit(_) => "voluntary_exit",
             EventKind::FinalizedCheckpoint(_) => "finalized_checkpoint",
@@ -1023,8 +1142,14 @@ impl<T: EthSpec> EventKind<T> {
             EventKind::ContributionAndProof(_) => "contribution_and_proof",
             EventKind::PayloadAttributes(_) => "payload_attributes",
             EventKind::LateHead(_) => "late_head",
+            EventKind::LightClientFinalityUpdate(_) => "light_client_finality_update",
+            EventKind::LightClientOptimisticUpdate(_) => "light_client_optimistic_update",
             #[cfg(feature = "lighthouse")]
             EventKind::BlockReward(_) => "block_reward",
+            EventKind::ProposerSlashing(_) => "proposer_slashing",
+            EventKind::AttesterSlashing(_) => "attester_slashing",
+            EventKind::BlsToExecutionChange(_) => "bls_to_execution_change",
+            EventKind::BlockGossip(_) => "block_gossip",
         }
     }
 
@@ -1052,6 +1177,9 @@ impl<T: EthSpec> EventKind<T> {
             )?)),
             "block" => Ok(EventKind::Block(serde_json::from_str(data).map_err(
                 |e| ServerError::InvalidServerSentEvent(format!("Block: {:?}", e)),
+            )?)),
+            "blob_sidecar" => Ok(EventKind::BlobSidecar(serde_json::from_str(data).map_err(
+                |e| ServerError::InvalidServerSentEvent(format!("Blob Sidecar: {:?}", e)),
             )?)),
             "chain_reorg" => Ok(EventKind::ChainReorg(serde_json::from_str(data).map_err(
                 |e| ServerError::InvalidServerSentEvent(format!("Chain Reorg: {:?}", e)),
@@ -1082,9 +1210,43 @@ impl<T: EthSpec> EventKind<T> {
                     ServerError::InvalidServerSentEvent(format!("Payload Attributes: {:?}", e))
                 })?,
             )),
+            "light_client_finality_update" => Ok(EventKind::LightClientFinalityUpdate(
+                serde_json::from_str(data).map_err(|e| {
+                    ServerError::InvalidServerSentEvent(format!(
+                        "Light Client Finality Update: {:?}",
+                        e
+                    ))
+                })?,
+            )),
+            "light_client_optimistic_update" => Ok(EventKind::LightClientOptimisticUpdate(
+                serde_json::from_str(data).map_err(|e| {
+                    ServerError::InvalidServerSentEvent(format!(
+                        "Light Client Optimistic Update: {:?}",
+                        e
+                    ))
+                })?,
+            )),
             #[cfg(feature = "lighthouse")]
             "block_reward" => Ok(EventKind::BlockReward(serde_json::from_str(data).map_err(
                 |e| ServerError::InvalidServerSentEvent(format!("Block Reward: {:?}", e)),
+            )?)),
+            "attester_slashing" => Ok(EventKind::AttesterSlashing(
+                serde_json::from_str(data).map_err(|e| {
+                    ServerError::InvalidServerSentEvent(format!("Attester Slashing: {:?}", e))
+                })?,
+            )),
+            "proposer_slashing" => Ok(EventKind::ProposerSlashing(
+                serde_json::from_str(data).map_err(|e| {
+                    ServerError::InvalidServerSentEvent(format!("Proposer Slashing: {:?}", e))
+                })?,
+            )),
+            "bls_to_execution_change" => Ok(EventKind::BlsToExecutionChange(
+                serde_json::from_str(data).map_err(|e| {
+                    ServerError::InvalidServerSentEvent(format!("Bls To Execution Change: {:?}", e))
+                })?,
+            )),
+            "block_gossip" => Ok(EventKind::BlockGossip(serde_json::from_str(data).map_err(
+                |e| ServerError::InvalidServerSentEvent(format!("Block Gossip: {:?}", e)),
             )?)),
             _ => Err(ServerError::InvalidServerSentEvent(
                 "Could not parse event tag".to_string(),
@@ -1105,6 +1267,7 @@ pub struct EventQuery {
 pub enum EventTopic {
     Head,
     Block,
+    BlobSidecar,
     Attestation,
     VoluntaryExit,
     FinalizedCheckpoint,
@@ -1112,8 +1275,14 @@ pub enum EventTopic {
     ContributionAndProof,
     LateHead,
     PayloadAttributes,
+    LightClientFinalityUpdate,
+    LightClientOptimisticUpdate,
     #[cfg(feature = "lighthouse")]
     BlockReward,
+    AttesterSlashing,
+    ProposerSlashing,
+    BlsToExecutionChange,
+    BlockGossip,
 }
 
 impl FromStr for EventTopic {
@@ -1123,6 +1292,7 @@ impl FromStr for EventTopic {
         match s {
             "head" => Ok(EventTopic::Head),
             "block" => Ok(EventTopic::Block),
+            "blob_sidecar" => Ok(EventTopic::BlobSidecar),
             "attestation" => Ok(EventTopic::Attestation),
             "voluntary_exit" => Ok(EventTopic::VoluntaryExit),
             "finalized_checkpoint" => Ok(EventTopic::FinalizedCheckpoint),
@@ -1130,8 +1300,14 @@ impl FromStr for EventTopic {
             "contribution_and_proof" => Ok(EventTopic::ContributionAndProof),
             "payload_attributes" => Ok(EventTopic::PayloadAttributes),
             "late_head" => Ok(EventTopic::LateHead),
+            "light_client_finality_update" => Ok(EventTopic::LightClientFinalityUpdate),
+            "light_client_optimistic_update" => Ok(EventTopic::LightClientOptimisticUpdate),
             #[cfg(feature = "lighthouse")]
             "block_reward" => Ok(EventTopic::BlockReward),
+            "attester_slashing" => Ok(EventTopic::AttesterSlashing),
+            "proposer_slashing" => Ok(EventTopic::ProposerSlashing),
+            "bls_to_execution_change" => Ok(EventTopic::BlsToExecutionChange),
+            "block_gossip" => Ok(EventTopic::BlockGossip),
             _ => Err("event topic cannot be parsed.".to_string()),
         }
     }
@@ -1142,6 +1318,7 @@ impl fmt::Display for EventTopic {
         match self {
             EventTopic::Head => write!(f, "head"),
             EventTopic::Block => write!(f, "block"),
+            EventTopic::BlobSidecar => write!(f, "blob_sidecar"),
             EventTopic::Attestation => write!(f, "attestation"),
             EventTopic::VoluntaryExit => write!(f, "voluntary_exit"),
             EventTopic::FinalizedCheckpoint => write!(f, "finalized_checkpoint"),
@@ -1149,8 +1326,14 @@ impl fmt::Display for EventTopic {
             EventTopic::ContributionAndProof => write!(f, "contribution_and_proof"),
             EventTopic::PayloadAttributes => write!(f, "payload_attributes"),
             EventTopic::LateHead => write!(f, "late_head"),
+            EventTopic::LightClientFinalityUpdate => write!(f, "light_client_finality_update"),
+            EventTopic::LightClientOptimisticUpdate => write!(f, "light_client_optimistic_update"),
             #[cfg(feature = "lighthouse")]
             EventTopic::BlockReward => write!(f, "block_reward"),
+            EventTopic::AttesterSlashing => write!(f, "attester_slashing"),
+            EventTopic::ProposerSlashing => write!(f, "proposer_slashing"),
+            EventTopic::BlsToExecutionChange => write!(f, "bls_to_execution_change"),
+            EventTopic::BlockGossip => write!(f, "block_gossip"),
         }
     }
 }
@@ -1339,6 +1522,7 @@ pub mod serde_status_code {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ssz::Encode;
 
     #[test]
     fn query_vec() {
@@ -1372,5 +1556,482 @@ mod tests {
             Accept::from_str("application/json;message=\"Hello, world!\";q=0.3,*/*;q=0.6").unwrap(),
             Accept::Any
         );
+    }
+
+    #[test]
+    fn ssz_signed_block_contents_pre_deneb() {
+        type E = MainnetEthSpec;
+        let spec = ForkName::Capella.make_genesis_spec(E::default_spec());
+
+        let block: PublishBlockRequest<E> = Arc::new(SignedBeaconBlock::from_block(
+            BeaconBlock::<E>::Capella(BeaconBlockCapella::empty(&spec)),
+            Signature::empty(),
+        ))
+        .try_into()
+        .expect("should convert into signed block contents");
+
+        let decoded: PublishBlockRequest<E> =
+            PublishBlockRequest::from_ssz_bytes(&block.as_ssz_bytes(), ForkName::Capella)
+                .expect("should decode Block");
+        assert!(matches!(decoded, PublishBlockRequest::Block(_)));
+    }
+
+    #[test]
+    fn ssz_signed_block_contents_with_blobs() {
+        type E = MainnetEthSpec;
+        let spec = ForkName::Deneb.make_genesis_spec(E::default_spec());
+
+        let block = SignedBeaconBlock::from_block(
+            BeaconBlock::<E>::Deneb(BeaconBlockDeneb::empty(&spec)),
+            Signature::empty(),
+        );
+        let blobs = BlobsList::<E>::from(vec![Blob::<E>::default()]);
+        let kzg_proofs = KzgProofs::<E>::from(vec![KzgProof::empty()]);
+        let signed_block_contents =
+            PublishBlockRequest::new(Arc::new(block), Some((kzg_proofs, blobs)));
+
+        let decoded: PublishBlockRequest<E> = PublishBlockRequest::from_ssz_bytes(
+            &signed_block_contents.as_ssz_bytes(),
+            ForkName::Deneb,
+        )
+        .expect("should decode BlockAndBlobSidecars");
+        assert!(matches!(decoded, PublishBlockRequest::BlockContents(_)));
+    }
+}
+
+#[derive(Debug, Encode, Serialize, Deserialize)]
+#[serde(untagged)]
+#[serde(bound = "E: EthSpec")]
+#[ssz(enum_behaviour = "transparent")]
+pub enum ProduceBlockV3Response<E: EthSpec> {
+    Full(FullBlockContents<E>),
+    Blinded(BlindedBeaconBlock<E>),
+}
+
+pub type JsonProduceBlockV3Response<E> =
+    ForkVersionedResponse<ProduceBlockV3Response<E>, ProduceBlockV3Metadata>;
+
+/// A wrapper over a [`BeaconBlock`] or a [`BlockContents`].
+#[derive(Debug, Encode, Serialize, Deserialize)]
+#[serde(untagged)]
+#[serde(bound = "E: EthSpec")]
+#[ssz(enum_behaviour = "transparent")]
+pub enum FullBlockContents<E: EthSpec> {
+    /// This is a full deneb variant with block and blobs.
+    BlockContents(BlockContents<E>),
+    /// This variant is for all pre-deneb full blocks.
+    Block(BeaconBlock<E>),
+}
+
+pub type BlockContentsTuple<E> = (BeaconBlock<E>, Option<(KzgProofs<E>, BlobsList<E>)>);
+
+// This value should never be used
+fn dummy_consensus_version() -> ForkName {
+    ForkName::Base
+}
+
+/// Metadata about a `ProduceBlockV3Response` which is returned in the body & headers.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ProduceBlockV3Metadata {
+    // The consensus version is serialized & deserialized by `ForkVersionedResponse`.
+    #[serde(
+        skip_serializing,
+        skip_deserializing,
+        default = "dummy_consensus_version"
+    )]
+    pub consensus_version: ForkName,
+    pub execution_payload_blinded: bool,
+    #[serde(with = "serde_utils::u256_dec")]
+    pub execution_payload_value: Uint256,
+    #[serde(with = "serde_utils::u256_dec")]
+    pub consensus_block_value: Uint256,
+}
+
+impl<E: EthSpec> FullBlockContents<E> {
+    pub fn new(block: BeaconBlock<E>, blob_data: Option<(KzgProofs<E>, BlobsList<E>)>) -> Self {
+        match blob_data {
+            Some((kzg_proofs, blobs)) => Self::BlockContents(BlockContents {
+                block,
+                kzg_proofs,
+                blobs,
+            }),
+            None => Self::Block(block),
+        }
+    }
+
+    /// SSZ decode with fork variant determined by slot.
+    pub fn from_ssz_bytes(bytes: &[u8], spec: &ChainSpec) -> Result<Self, ssz::DecodeError> {
+        let slot_len = <Slot as Decode>::ssz_fixed_len();
+        let slot_bytes = bytes
+            .get(0..slot_len)
+            .ok_or(DecodeError::InvalidByteLength {
+                len: bytes.len(),
+                expected: slot_len,
+            })?;
+        let slot = Slot::from_ssz_bytes(slot_bytes)?;
+        let fork_at_slot = spec.fork_name_at_slot::<E>(slot);
+        Self::from_ssz_bytes_for_fork(bytes, fork_at_slot)
+    }
+
+    /// SSZ decode with fork variant passed in explicitly.
+    pub fn from_ssz_bytes_for_fork(
+        bytes: &[u8],
+        fork_name: ForkName,
+    ) -> Result<Self, ssz::DecodeError> {
+        if fork_name.deneb_enabled() {
+            let mut builder = ssz::SszDecoderBuilder::new(bytes);
+
+            builder.register_anonymous_variable_length_item()?;
+            builder.register_type::<KzgProofs<E>>()?;
+            builder.register_type::<BlobsList<E>>()?;
+
+            let mut decoder = builder.build()?;
+            let block = decoder
+                .decode_next_with(|bytes| BeaconBlock::from_ssz_bytes_for_fork(bytes, fork_name))?;
+            let kzg_proofs = decoder.decode_next()?;
+            let blobs = decoder.decode_next()?;
+
+            Ok(FullBlockContents::new(block, Some((kzg_proofs, blobs))))
+        } else {
+            BeaconBlock::from_ssz_bytes_for_fork(bytes, fork_name)
+                .map(|block| FullBlockContents::Block(block))
+        }
+    }
+
+    pub fn block(&self) -> &BeaconBlock<E> {
+        match self {
+            FullBlockContents::BlockContents(block_and_sidecars) => &block_and_sidecars.block,
+            FullBlockContents::Block(block) => block,
+        }
+    }
+
+    pub fn deconstruct(self) -> BlockContentsTuple<E> {
+        match self {
+            FullBlockContents::BlockContents(block_and_sidecars) => (
+                block_and_sidecars.block,
+                Some((block_and_sidecars.kzg_proofs, block_and_sidecars.blobs)),
+            ),
+            FullBlockContents::Block(block) => (block, None),
+        }
+    }
+
+    /// Signs `self`, producing a `SignedBlockContents`.
+    pub fn sign(
+        self,
+        secret_key: &SecretKey,
+        fork: &Fork,
+        genesis_validators_root: Hash256,
+        spec: &ChainSpec,
+    ) -> PublishBlockRequest<E> {
+        let (block, maybe_blobs) = self.deconstruct();
+        let signed_block = block.sign(secret_key, fork, genesis_validators_root, spec);
+        PublishBlockRequest::new(Arc::new(signed_block), maybe_blobs)
+    }
+}
+
+impl<E: EthSpec> ForkVersionDeserialize for FullBlockContents<E> {
+    fn deserialize_by_fork<'de, D: serde::Deserializer<'de>>(
+        value: serde_json::value::Value,
+        fork_name: ForkName,
+    ) -> Result<Self, D::Error> {
+        if fork_name.deneb_enabled() {
+            Ok(FullBlockContents::BlockContents(
+                BlockContents::deserialize_by_fork::<'de, D>(value, fork_name)?,
+            ))
+        } else {
+            Ok(FullBlockContents::Block(
+                BeaconBlock::deserialize_by_fork::<'de, D>(value, fork_name)?,
+            ))
+        }
+    }
+}
+
+impl<E: EthSpec> From<FullBlockContents<E>> for BeaconBlock<E> {
+    fn from(from: FullBlockContents<E>) -> BeaconBlock<E> {
+        match from {
+            FullBlockContents::<E>::BlockContents(block_and_sidecars) => block_and_sidecars.block,
+            FullBlockContents::<E>::Block(block) => block,
+        }
+    }
+}
+
+pub type SignedBlockContentsTuple<E> = (
+    Arc<SignedBeaconBlock<E>>,
+    Option<(KzgProofs<E>, BlobsList<E>)>,
+);
+
+fn parse_required_header<T>(
+    headers: &HeaderMap,
+    header_name: &str,
+    parse: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let str_value = headers
+        .get(header_name)
+        .ok_or_else(|| format!("missing required header {header_name}"))?
+        .to_str()
+        .map_err(|e| format!("invalid value in {header_name}: {e}"))?;
+    parse(str_value)
+}
+
+impl TryFrom<&HeaderMap> for ProduceBlockV3Metadata {
+    type Error = String;
+
+    fn try_from(headers: &HeaderMap) -> Result<Self, Self::Error> {
+        let consensus_version = parse_required_header(headers, CONSENSUS_VERSION_HEADER, |s| {
+            s.parse::<ForkName>()
+                .map_err(|e| format!("invalid {CONSENSUS_VERSION_HEADER}: {e:?}"))
+        })?;
+        let execution_payload_blinded =
+            parse_required_header(headers, EXECUTION_PAYLOAD_BLINDED_HEADER, |s| {
+                s.parse::<bool>()
+                    .map_err(|e| format!("invalid {EXECUTION_PAYLOAD_BLINDED_HEADER}: {e:?}"))
+            })?;
+        let execution_payload_value =
+            parse_required_header(headers, EXECUTION_PAYLOAD_VALUE_HEADER, |s| {
+                Uint256::from_str_radix(s, 10)
+                    .map_err(|e| format!("invalid {EXECUTION_PAYLOAD_VALUE_HEADER}: {e:?}"))
+            })?;
+        let consensus_block_value =
+            parse_required_header(headers, CONSENSUS_BLOCK_VALUE_HEADER, |s| {
+                Uint256::from_str_radix(s, 10)
+                    .map_err(|e| format!("invalid {CONSENSUS_BLOCK_VALUE_HEADER}: {e:?}"))
+            })?;
+
+        Ok(ProduceBlockV3Metadata {
+            consensus_version,
+            execution_payload_blinded,
+            execution_payload_value,
+            consensus_block_value,
+        })
+    }
+}
+
+/// A wrapper over a [`SignedBeaconBlock`] or a [`SignedBlockContents`].
+#[derive(Clone, Debug, Encode, Serialize, Deserialize)]
+#[serde(untagged)]
+#[serde(bound = "E: EthSpec")]
+#[ssz(enum_behaviour = "transparent")]
+pub enum PublishBlockRequest<E: EthSpec> {
+    BlockContents(SignedBlockContents<E>),
+    Block(Arc<SignedBeaconBlock<E>>),
+}
+
+impl<E: EthSpec> PublishBlockRequest<E> {
+    pub fn new(
+        block: Arc<SignedBeaconBlock<E>>,
+        blob_items: Option<(KzgProofs<E>, BlobsList<E>)>,
+    ) -> Self {
+        match blob_items {
+            Some((kzg_proofs, blobs)) => Self::BlockContents(SignedBlockContents {
+                signed_block: block,
+                kzg_proofs,
+                blobs,
+            }),
+            None => Self::Block(block),
+        }
+    }
+
+    /// SSZ decode with fork variant determined by `fork_name`.
+    pub fn from_ssz_bytes(bytes: &[u8], fork_name: ForkName) -> Result<Self, ssz::DecodeError> {
+        if fork_name.deneb_enabled() {
+            let mut builder = ssz::SszDecoderBuilder::new(bytes);
+            builder.register_anonymous_variable_length_item()?;
+            builder.register_type::<KzgProofs<E>>()?;
+            builder.register_type::<BlobsList<E>>()?;
+
+            let mut decoder = builder.build()?;
+            let block = decoder.decode_next_with(|bytes| {
+                SignedBeaconBlock::from_ssz_bytes_for_fork(bytes, fork_name)
+            })?;
+            let kzg_proofs = decoder.decode_next()?;
+            let blobs = decoder.decode_next()?;
+            Ok(PublishBlockRequest::new(
+                Arc::new(block),
+                Some((kzg_proofs, blobs)),
+            ))
+        } else {
+            SignedBeaconBlock::from_ssz_bytes_for_fork(bytes, fork_name)
+                .map(|block| PublishBlockRequest::Block(Arc::new(block)))
+        }
+    }
+
+    pub fn signed_block(&self) -> &Arc<SignedBeaconBlock<E>> {
+        match self {
+            PublishBlockRequest::BlockContents(block_and_sidecars) => {
+                &block_and_sidecars.signed_block
+            }
+            PublishBlockRequest::Block(block) => block,
+        }
+    }
+
+    pub fn deconstruct(self) -> SignedBlockContentsTuple<E> {
+        match self {
+            PublishBlockRequest::BlockContents(block_and_sidecars) => (
+                block_and_sidecars.signed_block,
+                Some((block_and_sidecars.kzg_proofs, block_and_sidecars.blobs)),
+            ),
+            PublishBlockRequest::Block(block) => (block, None),
+        }
+    }
+}
+
+impl<E: EthSpec> TryFrom<Arc<SignedBeaconBlock<E>>> for PublishBlockRequest<E> {
+    type Error = &'static str;
+    fn try_from(block: Arc<SignedBeaconBlock<E>>) -> Result<Self, Self::Error> {
+        match *block {
+            SignedBeaconBlock::Base(_)
+            | SignedBeaconBlock::Altair(_)
+            | SignedBeaconBlock::Bellatrix(_)
+            | SignedBeaconBlock::Capella(_) => Ok(PublishBlockRequest::Block(block)),
+            SignedBeaconBlock::Deneb(_) | SignedBeaconBlock::Electra(_) => Err(
+                "post-Deneb block contents cannot be fully constructed from just the signed block",
+            ),
+        }
+    }
+}
+
+impl<E: EthSpec> From<SignedBlockContentsTuple<E>> for PublishBlockRequest<E> {
+    fn from(block_contents_tuple: SignedBlockContentsTuple<E>) -> Self {
+        PublishBlockRequest::new(block_contents_tuple.0, block_contents_tuple.1)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode)]
+#[serde(bound = "E: EthSpec")]
+pub struct SignedBlockContents<E: EthSpec> {
+    pub signed_block: Arc<SignedBeaconBlock<E>>,
+    pub kzg_proofs: KzgProofs<E>,
+    #[serde(with = "ssz_types::serde_utils::list_of_hex_fixed_vec")]
+    pub blobs: BlobsList<E>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode)]
+#[serde(bound = "E: EthSpec")]
+pub struct BlockContents<E: EthSpec> {
+    pub block: BeaconBlock<E>,
+    pub kzg_proofs: KzgProofs<E>,
+    #[serde(with = "ssz_types::serde_utils::list_of_hex_fixed_vec")]
+    pub blobs: BlobsList<E>,
+}
+
+impl<E: EthSpec> ForkVersionDeserialize for BlockContents<E> {
+    fn deserialize_by_fork<'de, D: serde::Deserializer<'de>>(
+        value: serde_json::value::Value,
+        fork_name: ForkName,
+    ) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(bound = "E: EthSpec")]
+        struct Helper<E: EthSpec> {
+            block: serde_json::Value,
+            kzg_proofs: KzgProofs<E>,
+            #[serde(with = "ssz_types::serde_utils::list_of_hex_fixed_vec")]
+            blobs: BlobsList<E>,
+        }
+        let helper: Helper<E> = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+
+        Ok(Self {
+            block: BeaconBlock::deserialize_by_fork::<'de, D>(helper.block, fork_name)?,
+            kzg_proofs: helper.kzg_proofs,
+            blobs: helper.blobs,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode)]
+#[serde(untagged)]
+#[serde(bound = "E: EthSpec")]
+#[ssz(enum_behaviour = "transparent")]
+pub enum FullPayloadContents<E: EthSpec> {
+    Payload(ExecutionPayload<E>),
+    PayloadAndBlobs(ExecutionPayloadAndBlobs<E>),
+}
+
+impl<E: EthSpec> FullPayloadContents<E> {
+    pub fn new(
+        execution_payload: ExecutionPayload<E>,
+        maybe_blobs: Option<BlobsBundle<E>>,
+    ) -> Self {
+        match maybe_blobs {
+            None => Self::Payload(execution_payload),
+            Some(blobs_bundle) => Self::PayloadAndBlobs(ExecutionPayloadAndBlobs {
+                execution_payload,
+                blobs_bundle,
+            }),
+        }
+    }
+
+    pub fn payload_ref(&self) -> &ExecutionPayload<E> {
+        match self {
+            FullPayloadContents::Payload(payload) => payload,
+            FullPayloadContents::PayloadAndBlobs(payload_and_blobs) => {
+                &payload_and_blobs.execution_payload
+            }
+        }
+    }
+
+    pub fn block_hash(&self) -> ExecutionBlockHash {
+        self.payload_ref().block_hash()
+    }
+
+    pub fn deconstruct(self) -> (ExecutionPayload<E>, Option<BlobsBundle<E>>) {
+        match self {
+            FullPayloadContents::Payload(payload) => (payload, None),
+            FullPayloadContents::PayloadAndBlobs(payload_and_blobs) => (
+                payload_and_blobs.execution_payload,
+                Some(payload_and_blobs.blobs_bundle),
+            ),
+        }
+    }
+}
+
+impl<E: EthSpec> ForkVersionDeserialize for FullPayloadContents<E> {
+    fn deserialize_by_fork<'de, D: Deserializer<'de>>(
+        value: Value,
+        fork_name: ForkName,
+    ) -> Result<Self, D::Error> {
+        match fork_name {
+            ForkName::Bellatrix | ForkName::Capella => serde_json::from_value(value)
+                .map(Self::Payload)
+                .map_err(serde::de::Error::custom),
+            ForkName::Deneb | ForkName::Electra => serde_json::from_value(value)
+                .map(Self::PayloadAndBlobs)
+                .map_err(serde::de::Error::custom),
+            ForkName::Base | ForkName::Altair => Err(serde::de::Error::custom(format!(
+                "FullPayloadContents deserialization for {fork_name} not implemented"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode)]
+#[serde(bound = "E: EthSpec")]
+pub struct ExecutionPayloadAndBlobs<E: EthSpec> {
+    pub execution_payload: ExecutionPayload<E>,
+    pub blobs_bundle: BlobsBundle<E>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[serde(bound = "E: EthSpec")]
+pub struct BlobsBundle<E: EthSpec> {
+    pub commitments: KzgCommitments<E>,
+    pub proofs: KzgProofs<E>,
+    #[serde(with = "ssz_types::serde_utils::list_of_hex_fixed_vec")]
+    pub blobs: BlobsList<E>,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn validator_id_serde() {
+        let id_str = "\"1\"";
+        let x: ValidatorId = serde_json::from_str(id_str).unwrap();
+        assert_eq!(x, ValidatorId::Index(1));
+        assert_eq!(serde_json::to_string(&x).unwrap(), id_str);
+
+        let pubkey_str = "\"0xb824b5ede33a7b05a378a84b183b4bc7e7db894ce48b659f150c97d359edca2f503081d6678d1200f582ec7cafa9caf2\"";
+        let y: ValidatorId = serde_json::from_str(pubkey_str).unwrap();
+        assert_eq!(serde_json::to_string(&y).unwrap(), pubkey_str);
     }
 }

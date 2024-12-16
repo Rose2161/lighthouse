@@ -12,6 +12,7 @@ pub struct SignedValidatorRegistrationData {
 
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone, Encode, Decode, TreeHash)]
 pub struct ValidatorRegistrationData {
+    #[serde(with = "serde_utils::address_hex")]
     pub fee_recipient: Address,
     #[serde(with = "serde_utils::quoted_u64")]
     pub gas_limit: u64,
@@ -21,3 +22,17 @@ pub struct ValidatorRegistrationData {
 }
 
 impl SignedRoot for ValidatorRegistrationData {}
+
+impl SignedValidatorRegistrationData {
+    pub fn verify_signature(&self, spec: &ChainSpec) -> bool {
+        self.message
+            .pubkey
+            .decompress()
+            .map(|pubkey| {
+                let domain = spec.get_builder_domain();
+                let message = self.message.signing_root(domain);
+                self.signature.verify(&pubkey, message)
+            })
+            .unwrap_or(false)
+    }
+}
