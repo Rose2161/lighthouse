@@ -1,13 +1,14 @@
 use account_utils::ZeroizeString;
 use eth2_keystore::Keystore;
 use serde::{Deserialize, Serialize};
-use types::{Address, PublicKeyBytes};
+use types::{Address, Graffiti, PublicKeyBytes};
 
 pub use slashing_protection::interchange::Interchange;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct GetFeeRecipientResponse {
     pub pubkey: PublicKeyBytes,
+    #[serde(with = "serde_utils::address_hex")]
     pub ethaddress: Address,
 }
 
@@ -171,4 +172,10 @@ pub enum DeleteRemotekeyStatus {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DeleteRemotekeysResponse {
     pub data: Vec<Status<DeleteRemotekeyStatus>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GetGraffitiResponse {
+    pub pubkey: PublicKeyBytes,
+    pub graffiti: Graffiti,
 }
