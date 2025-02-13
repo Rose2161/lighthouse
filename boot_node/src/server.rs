@@ -5,30 +5,30 @@ use crate::config::BootNodeConfigSerialization;
 use clap::ArgMatches;
 use eth2_network_config::Eth2NetworkConfig;
 use lighthouse_network::{
-    discv5::{enr::NodeId, Discv5, Discv5Event},
+    discv5::{self, enr::NodeId, Discv5},
     EnrExt, Eth2Enr,
 };
 use slog::info;
 use types::EthSpec;
 
-pub async fn run<T: EthSpec>(
-    lh_matches: &ArgMatches<'_>,
-    bn_matches: &ArgMatches<'_>,
+pub async fn run<E: EthSpec>(
+    lh_matches: &ArgMatches,
+    bn_matches: &ArgMatches,
     eth2_network_config: &Eth2NetworkConfig,
     log: slog::Logger,
 ) -> Result<(), String> {
     // parse the CLI args into a useable config
-    let config: BootNodeConfig<T> = BootNodeConfig::new(bn_matches, eth2_network_config).await?;
+    let config: BootNodeConfig<E> = BootNodeConfig::new(bn_matches, eth2_network_config).await?;
 
     // Dump configs if `dump-config` or `dump-chain-config` flags are set
     let config_sz = BootNodeConfigSerialization::from_config_ref(&config);
-    clap_utils::check_dump_configs::<_, T>(
+    clap_utils::check_dump_configs::<_, E>(
         lh_matches,
         &config_sz,
-        &eth2_network_config.chain_spec::<T>()?,
+        &eth2_network_config.chain_spec::<E>()?,
     )?;
 
-    if lh_matches.is_present("immediate-shutdown") {
+    if lh_matches.get_flag("immediate-shutdown") {
         return Ok(());
     }
 
@@ -136,25 +136,22 @@ pub async fn run<T: EthSpec>(
                     "active_sessions" => metrics.active_sessions,
                     "requests/s" => format_args!("{:.2}", metrics.unsolicited_requests_per_second),
                     "ipv4_nodes" => ipv4_only_reachable,
-                    "ipv6_nodes" => ipv6_only_reachable,
-                    "ipv6_and_ipv4_nodes" => ipv4_ipv6_reachable,
+                    "ipv6_only_nodes" => ipv6_only_reachable,
+                    "dual_stack_nodes" => ipv4_ipv6_reachable,
                     "unreachable_nodes" => unreachable_nodes,
                 );
 
             }
             Some(event) = event_stream.recv() => {
                 match event {
-                    Discv5Event::Discovered(_enr) => {
-                        // An ENR has bee obtained by the server
+                    discv5::Event::Discovered(_enr) => {
+                        // An ENR has been obtained by the server
                         // Ignore these events here
                     }
-                    Discv5Event::EnrAdded { .. } => {}     // Ignore
-                    Discv5Event::TalkRequest(_) => {}     // Ignore
-                    Discv5Event::NodeInserted { .. } => {} // Ignore
-                    Discv5Event::SocketUpdated(socket_addr) => {
+                    discv5::Event::SocketUpdated(socket_addr) => {
                         info!(log, "Advertised socket address updated"; "socket_addr" => %socket_addr);
                     }
-                    Discv5Event::SessionEstablished{ .. } => {} // Ignore
+                    _ => {} // Ignore
                 }
             }
         }

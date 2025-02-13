@@ -1,40 +1,36 @@
 use crate::multiaddr::Protocol;
+use crate::rpc::methods::MetaDataV3;
 use crate::rpc::{MetaData, MetaDataV1, MetaDataV2};
-use crate::types::{
-    error, EnrAttestationBitfield, EnrSyncCommitteeBitfield, GossipEncoding, GossipKind,
-};
+use crate::types::{EnrAttestationBitfield, EnrSyncCommitteeBitfield, GossipEncoding, GossipKind};
 use crate::{GossipTopic, NetworkConfig};
 use futures::future::Either;
-use libp2p::bandwidth::BandwidthSinks;
+use gossipsub;
 use libp2p::core::{multiaddr::Multiaddr, muxing::StreamMuxerBox, transport::Boxed};
-use libp2p::gossipsub;
 use libp2p::identity::{secp256k1, Keypair};
-use libp2p::{core, noise, yamux, PeerId, Transport, TransportExt};
-use libp2p_quic;
+use libp2p::{core, noise, yamux, PeerId, Transport};
 use prometheus_client::registry::Registry;
 use slog::{debug, warn};
 use ssz::Decode;
-use ssz::Encode;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use types::{ChainSpec, EnrForkId, EthSpec, ForkContext, SubnetId, SyncSubnetId};
+use types::{
+    ChainSpec, DataColumnSubnetId, EnrForkId, EthSpec, ForkContext, SubnetId, SyncSubnetId,
+};
 
 pub const NETWORK_KEY_FILENAME: &str = "key";
-/// The maximum simultaneous libp2p connections per peer.
-pub const MAX_CONNECTIONS_PER_PEER: u32 = 1;
 /// The filename to store our local metadata.
 pub const METADATA_FILENAME: &str = "metadata";
 
 pub struct Context<'a> {
-    pub config: &'a NetworkConfig,
+    pub config: Arc<NetworkConfig>,
     pub enr_fork_id: EnrForkId,
     pub fork_context: Arc<ForkContext>,
-    pub chain_spec: &'a ChainSpec,
-    pub gossipsub_registry: Option<&'a mut Registry>,
+    pub chain_spec: Arc<ChainSpec>,
+    pub libp2p_registry: Option<&'a mut Registry>,
 }
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
@@ -44,16 +40,14 @@ type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 pub fn build_transport(
     local_private_key: Keypair,
     quic_support: bool,
-) -> std::io::Result<(BoxedTransport, Arc<BandwidthSinks>)> {
+) -> std::io::Result<BoxedTransport> {
     // mplex config
     let mut mplex_config = libp2p_mplex::MplexConfig::new();
     mplex_config.set_max_buffer_size(256);
     mplex_config.set_max_buffer_behaviour(libp2p_mplex::MaxBufferBehaviour::Block);
 
     // yamux config
-    let mut yamux_config = yamux::Config::default();
-    yamux_config.set_window_update_mode(yamux::WindowUpdateMode::on_read());
-
+    let yamux_config = yamux::Config::default();
     // Creates the TCP transport layer
     let tcp = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true))
         .upgrade(core::upgrade::Version::V1)
@@ -63,30 +57,31 @@ pub fn build_transport(
             mplex_config,
         ))
         .timeout(Duration::from_secs(10));
-
-    let (transport, bandwidth) = if quic_support {
+    let transport = if quic_support {
         // Enables Quic
         // The default quic configuration suits us for now.
-        let quic_config = libp2p_quic::Config::new(&local_private_key);
-        tcp.or_transport(libp2p_quic::tokio::Transport::new(quic_config))
+        let quic_config = libp2p::quic::Config::new(&local_private_key);
+        let quic = libp2p::quic::tokio::Transport::new(quic_config);
+        let transport = tcp
+            .or_transport(quic)
             .map(|either_output, _| match either_output {
                 Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
                 Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-            })
-            .with_bandwidth_logging()
+            });
+        transport.boxed()
     } else {
-        tcp.with_bandwidth_logging()
+        tcp.boxed()
     };
 
-    // // Enables DNS over the transport.
-    let transport = libp2p::dns::TokioDnsConfig::system(transport)?.boxed();
+    // Enables DNS over the transport.
+    let transport = libp2p::dns::tokio::Transport::system(transport)?.boxed();
 
-    Ok((transport, bandwidth))
+    Ok(transport)
 }
 
 // Useful helper functions for debugging. Currently not used in the client.
 #[allow(dead_code)]
-fn keypair_from_hex(hex_bytes: &str) -> error::Result<Keypair> {
+fn keypair_from_hex(hex_bytes: &str) -> Result<Keypair, String> {
     let hex_bytes = if let Some(stripped) = hex_bytes.strip_prefix("0x") {
         stripped.to_string()
     } else {
@@ -94,18 +89,18 @@ fn keypair_from_hex(hex_bytes: &str) -> error::Result<Keypair> {
     };
 
     hex::decode(hex_bytes)
-        .map_err(|e| format!("Failed to parse p2p secret key bytes: {:?}", e).into())
+        .map_err(|e| format!("Failed to parse p2p secret key bytes: {:?}", e))
         .and_then(keypair_from_bytes)
 }
 
 #[allow(dead_code)]
-fn keypair_from_bytes(mut bytes: Vec<u8>) -> error::Result<Keypair> {
+fn keypair_from_bytes(mut bytes: Vec<u8>) -> Result<Keypair, String> {
     secp256k1::SecretKey::try_from_bytes(&mut bytes)
         .map(|secret| {
             let keypair: secp256k1::Keypair = secret.into();
             keypair.into()
         })
-        .map_err(|e| format!("Unable to parse p2p secret key: {:?}", e).into())
+        .map_err(|e| format!("Unable to parse p2p secret key: {:?}", e))
 }
 
 /// Loads a private key from disk. If this fails, a new key is
@@ -170,6 +165,7 @@ pub fn strip_peer_id(addr: &mut Multiaddr) {
 /// Load metadata from persisted file. Return default metadata if loading fails.
 pub fn load_or_build_metadata<E: EthSpec>(
     network_dir: &std::path::Path,
+    custody_subnet_count: Option<u64>,
     log: &slog::Logger,
 ) -> MetaData<E> {
     // We load a V2 metadata version by default (regardless of current fork)
@@ -220,7 +216,16 @@ pub fn load_or_build_metadata<E: EthSpec>(
     };
 
     // Wrap the MetaData
-    let meta_data = MetaData::V2(meta_data);
+    let meta_data = if let Some(custody_count) = custody_subnet_count {
+        MetaData::V3(MetaDataV3 {
+            attnets: meta_data.attnets,
+            seq_number: meta_data.seq_number,
+            syncnets: meta_data.syncnets,
+            custody_subnet_count: custody_count,
+        })
+    } else {
+        MetaData::V2(meta_data)
+    };
 
     debug!(log, "Metadata sequence number"; "seq_num" => meta_data.seq_number());
     save_metadata_to_disk(network_dir, meta_data.clone(), log);
@@ -233,6 +238,8 @@ pub(crate) fn create_whitelist_filter(
     possible_fork_digests: Vec<[u8; 4]>,
     attestation_subnet_count: u64,
     sync_committee_subnet_count: u64,
+    blob_sidecar_subnet_count: u64,
+    data_column_sidecar_subnet_count: u64,
 ) -> gossipsub::WhitelistSubscriptionFilter {
     let mut possible_hashes = HashSet::new();
     for fork_digest in possible_fork_digests {
@@ -258,6 +265,12 @@ pub(crate) fn create_whitelist_filter(
         for id in 0..sync_committee_subnet_count {
             add(SyncCommitteeMessage(SyncSubnetId::new(id)));
         }
+        for id in 0..blob_sidecar_subnet_count {
+            add(BlobSidecar(id));
+        }
+        for id in 0..data_column_sidecar_subnet_count {
+            add(DataColumnSidecar(DataColumnSubnetId::new(id)));
+        }
     }
     gossipsub::WhitelistSubscriptionFilter(possible_hashes)
 }
@@ -269,10 +282,11 @@ pub(crate) fn save_metadata_to_disk<E: EthSpec>(
     log: &slog::Logger,
 ) {
     let _ = std::fs::create_dir_all(dir);
-    let metadata_bytes = match metadata {
-        MetaData::V1(md) => md.as_ssz_bytes(),
-        MetaData::V2(md) => md.as_ssz_bytes(),
-    };
+    // We always store the metadata v2 to disk because
+    // custody_subnet_count parameter doesn't need to be persisted across runs.
+    // custody_subnet_count is what the user sets it for the current run.
+    // This is to prevent ugly branching logic when reading the metadata from disk.
+    let metadata_bytes = metadata.metadata_v2().as_ssz_bytes();
     match File::create(dir.join(METADATA_FILENAME)).and_then(|mut f| f.write_all(&metadata_bytes)) {
         Ok(_) => {
             debug!(log, "Metadata written to disk");

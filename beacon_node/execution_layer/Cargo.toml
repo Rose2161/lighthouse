@@ -6,29 +6,28 @@ edition = { workspace = true }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+alloy-primitives = { workspace = true }
 types = { workspace = true }
 tokio = { workspace = true }
-async-trait = "0.1.51"
 slog = { workspace = true }
-futures = { workspace = true }
+logging = { workspace = true }
 sensitive_url = { workspace = true }
 reqwest = { workspace = true }
 ethereum_serde_utils = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 warp = { workspace = true }
-jsonwebtoken = "8"
-environment = { workspace = true }
+jsonwebtoken = "9"
 bytes = { workspace = true }
 task_executor = { workspace = true }
 hex = { workspace = true }
 ethereum_ssz = { workspace = true }
 ssz_types = { workspace = true }
 eth2 = { workspace = true }
+kzg = { workspace = true }
 state_processing = { workspace = true }
 superstruct = { workspace = true }
 lru = { workspace = true }
-exit-future = { workspace = true }
 tree_hash = { workspace = true }
 tree_hash_derive = { workspace = true }
 parking_lot = { workspace = true }
@@ -36,16 +35,10 @@ slot_clock = { workspace = true }
 tempfile = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
-lighthouse_metrics = { workspace = true }
-lazy_static = { workspace = true }
+metrics = { workspace = true }
 ethers-core = { workspace = true }
 builder_client = { path = "../builder_client" }
 fork_choice = { workspace = true }
-mev-rs = { git = "https://github.com/ralexstokes/mev-rs", rev = "216657016d5c0889b505857c89ae42c7aa2764af" }
-axum = "0.6"
-hyper = "0.14"
-ethereum-consensus = { git = "https://github.com/ralexstokes/ethereum-consensus", rev = "e380108" }
-ssz_rs = "0.9.0"
 tokio-stream = { workspace = true }
 strum = { workspace = true }
 keccak-hash = "0.10.0"
@@ -54,3 +47,9 @@ triehash = "0.8.4"
 hash-db = "0.15.2"
 pretty_reqwest_error = { workspace = true }
 arc-swap = "1.6.0"
+eth2_network_config = { workspace = true }
+alloy-rlp = { workspace = true }
+alloy-consensus = { workspace = true }
+lighthouse_version = { workspace = true }
+fixed_bytes = { workspace = true }
+sha2 = { workspace = true }

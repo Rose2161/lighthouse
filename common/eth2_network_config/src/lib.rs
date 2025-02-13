@@ -14,6 +14,7 @@
 use bytes::Bytes;
 use discv5::enr::{CombinedKey, Enr};
 use eth2_config::{instantiate_hardcoded_nets, HardcodedNet};
+use kzg::trusted_setup::get_trusted_setup;
 use pretty_reqwest_error::PrettyReqwestError;
 use reqwest::{Client, Error};
 use sensitive_url::SensitiveUrl;
@@ -29,14 +30,14 @@ use url::Url;
 
 pub use eth2_config::GenesisStateSource;
 
-pub const DEPLOY_BLOCK_FILE: &str = "deploy_block.txt";
+pub const DEPLOY_BLOCK_FILE: &str = "deposit_contract_block.txt";
 pub const BOOT_ENR_FILE: &str = "boot_enr.yaml";
 pub const GENESIS_STATE_FILE: &str = "genesis.ssz";
 pub const BASE_CONFIG_FILE: &str = "config.yaml";
 
 // Creates definitions for:
 //
-// - Each of the `HardcodedNet` values (e.g., `MAINNET`, `PRATER`, etc).
+// - Each of the `HardcodedNet` values (e.g., `MAINNET`, `HOLESKY`, etc).
 // - `HARDCODED_NETS: &[HardcodedNet]`
 // - `HARDCODED_NET_NAMES: &[&'static str]`
 instantiate_hardcoded_nets!(eth2_config);
@@ -84,6 +85,7 @@ pub struct Eth2NetworkConfig {
     pub genesis_state_source: GenesisStateSource,
     pub genesis_state_bytes: Option<GenesisStateBytes>,
     pub config: Config,
+    pub kzg_trusted_setup: Vec<u8>,
 }
 
 impl Eth2NetworkConfig {
@@ -99,6 +101,9 @@ impl Eth2NetworkConfig {
 
     /// Instantiates `Self` from a `HardcodedNet`.
     fn from_hardcoded_net(net: &HardcodedNet) -> Result<Self, String> {
+        let config: Config = serde_yaml::from_reader(net.config)
+            .map_err(|e| format!("Unable to parse yaml config: {:?}", e))?;
+        let kzg_trusted_setup = get_trusted_setup();
         Ok(Self {
             deposit_contract_deploy_block: serde_yaml::from_reader(net.deploy_block)
                 .map_err(|e| format!("Unable to parse deploy block: {:?}", e))?,
@@ -110,8 +115,8 @@ impl Eth2NetworkConfig {
             genesis_state_bytes: Some(net.genesis_state_bytes)
                 .filter(|bytes| !bytes.is_empty())
                 .map(Into::into),
-            config: serde_yaml::from_reader(net.config)
-                .map_err(|e| format!("Unable to parse yaml config: {:?}", e))?,
+            config,
+            kzg_trusted_setup,
         })
     }
 
@@ -149,6 +154,32 @@ impl Eth2NetworkConfig {
         }
     }
 
+    /// Get the genesis state root for this network.
+    ///
+    /// `Ok(None)` will be returned if the genesis state is not known. No network requests will be
+    /// made by this function. This function will not error unless the genesis state configuration
+    /// is corrupted.
+    pub fn genesis_state_root<E: EthSpec>(&self) -> Result<Option<Hash256>, String> {
+        match self.genesis_state_source {
+            GenesisStateSource::Unknown => Ok(None),
+            GenesisStateSource::Url {
+                genesis_state_root, ..
+            } => Hash256::from_str(genesis_state_root)
+                .map(Option::Some)
+                .map_err(|e| format!("Unable to parse genesis state root: {:?}", e)),
+            GenesisStateSource::IncludedBytes => {
+                self.get_genesis_state_from_bytes::<E>()
+                    .and_then(|mut state| {
+                        Ok(Some(
+                            state
+                                .canonical_root()
+                                .map_err(|e| format!("Hashing error: {e:?}"))?,
+                        ))
+                    })
+            }
+        }
+    }
+
     /// Construct a consolidated `ChainSpec` from the YAML config.
     pub fn chain_spec<E: EthSpec>(&self) -> Result<ChainSpec, String> {
         ChainSpec::from_config::<E>(&self.config).ok_or_else(|| {
@@ -180,6 +211,7 @@ impl Eth2NetworkConfig {
                 urls: built_in_urls,
                 checksum,
                 genesis_validators_root,
+                ..
             } => {
                 let checksum = Hash256::from_str(checksum).map_err(|e| {
                     format!("Unable to parse genesis state bytes checksum: {:?}", e)
@@ -335,12 +367,15 @@ impl Eth2NetworkConfig {
             (None, GenesisStateSource::Unknown)
         };
 
+        let kzg_trusted_setup = get_trusted_setup();
+
         Ok(Self {
             deposit_contract_deploy_block,
             boot_enr,
             genesis_state_source,
             genesis_state_bytes: genesis_state_bytes.map(Into::into),
             config,
+            kzg_trusted_setup,
         })
     }
 }
@@ -435,7 +470,7 @@ mod tests {
     use super::*;
     use ssz::Encode;
     use tempfile::Builder as TempBuilder;
-    use types::{Config, Eth1Data, GnosisEthSpec, Hash256, MainnetEthSpec};
+    use types::{Eth1Data, FixedBytesExtended, GnosisEthSpec, MainnetEthSpec};
 
     type E = MainnetEthSpec;
 
@@ -476,13 +511,6 @@ mod tests {
     }
 
     #[test]
-    fn prater_and_goerli_are_equal() {
-        let goerli = Eth2NetworkConfig::from_hardcoded_net(&GOERLI).unwrap();
-        let prater = Eth2NetworkConfig::from_hardcoded_net(&PRATER).unwrap();
-        assert_eq!(goerli, prater);
-    }
-
-    #[test]
     fn hard_coded_nets_work() {
         for net in HARDCODED_NETS {
             let config = Eth2NetworkConfig::from_hardcoded_net(net)
@@ -506,6 +534,7 @@ mod tests {
                 urls,
                 checksum,
                 genesis_validators_root,
+                ..
             } = net.genesis_state_source
             {
                 Hash256::from_str(checksum).expect("the checksum must be a valid 32-byte value");
@@ -556,8 +585,10 @@ mod tests {
         } else {
             GenesisStateSource::Unknown
         };
+        // With Deneb enabled by default we must set a trusted setup here.
+        let kzg_trusted_setup = get_trusted_setup();
 
-        let testnet: Eth2NetworkConfig = Eth2NetworkConfig {
+        let testnet = Eth2NetworkConfig {
             deposit_contract_deploy_block,
             boot_enr,
             genesis_state_source,
@@ -566,6 +597,7 @@ mod tests {
                 .map(Encode::as_ssz_bytes)
                 .map(Into::into),
             config,
+            kzg_trusted_setup,
         };
 
         testnet

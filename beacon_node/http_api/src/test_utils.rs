@@ -1,22 +1,22 @@
 use crate::{Config, Context};
 use beacon_chain::{
-    test_utils::{
-        BeaconChainHarness, BoxedMutator, Builder as HarnessBuilder, EphemeralHarnessType,
-    },
+    test_utils::{BeaconChainHarness, BoxedMutator, Builder, EphemeralHarnessType},
     BeaconChain, BeaconChainTypes,
 };
-use beacon_processor::{BeaconProcessor, BeaconProcessorChannels, BeaconProcessorConfig};
+use beacon_processor::{
+    BeaconProcessor, BeaconProcessorChannels, BeaconProcessorConfig, BeaconProcessorQueueLengths,
+};
 use directory::DEFAULT_ROOT_DIR;
 use eth2::{BeaconNodeHttpClient, Timeouts};
 use lighthouse_network::{
-    discv5::enr::{CombinedKey, EnrBuilder},
+    discv5::enr::CombinedKey,
     libp2p::swarm::{
         behaviour::{ConnectionEstablished, FromSwarm},
         ConnectionId, NetworkBehaviour,
     },
     rpc::methods::{MetaData, MetaDataV2},
     types::{EnrAttestationBitfield, EnrSyncCommitteeBitfield, SyncState},
-    ConnectedPoint, Enr, NetworkGlobals, PeerId, PeerManager,
+    ConnectedPoint, Enr, NetworkConfig, NetworkGlobals, PeerId, PeerManager,
 };
 use logging::test_logger;
 use network::{NetworkReceivers, NetworkSenders};
@@ -37,6 +37,7 @@ pub const EXTERNAL_ADDR: &str = "/ip4/0.0.0.0/tcp/9000";
 
 /// HTTP API tester that allows interaction with the underlying beacon chain harness.
 pub struct InteractiveTester<E: EthSpec> {
+    pub ctx: Arc<Context<EphemeralHarnessType<E>>>,
     pub harness: BeaconChainHarness<EphemeralHarnessType<E>>,
     pub client: BeaconNodeHttpClient,
     pub network_rx: NetworkReceivers<E>,
@@ -45,22 +46,23 @@ pub struct InteractiveTester<E: EthSpec> {
 /// The result of calling `create_api_server`.
 ///
 /// Glue-type between `tests::ApiTester` and `InteractiveTester`.
-pub struct ApiServer<E: EthSpec, SFut: Future<Output = ()>> {
+pub struct ApiServer<T: BeaconChainTypes, SFut: Future<Output = ()>> {
+    pub ctx: Arc<Context<T>>,
     pub server: SFut,
     pub listening_socket: SocketAddr,
-    pub network_rx: NetworkReceivers<E>,
+    pub network_rx: NetworkReceivers<T::EthSpec>,
     pub local_enr: Enr,
     pub external_peer_id: PeerId,
 }
 
-type Initializer<E> = Box<
-    dyn FnOnce(HarnessBuilder<EphemeralHarnessType<E>>) -> HarnessBuilder<EphemeralHarnessType<E>>,
->;
+type HarnessBuilder<E> = Builder<EphemeralHarnessType<E>>;
+type Initializer<E> = Box<dyn FnOnce(HarnessBuilder<E>) -> HarnessBuilder<E>>;
 type Mutator<E> = BoxedMutator<E, MemoryStore<E>, MemoryStore<E>>;
 
 impl<E: EthSpec> InteractiveTester<E> {
     pub async fn new(spec: Option<ChainSpec>, validator_count: usize) -> Self {
-        Self::new_with_initializer_and_mutator(spec, validator_count, None, None).await
+        Self::new_with_initializer_and_mutator(spec, validator_count, None, None, Config::default())
+            .await
     }
 
     pub async fn new_with_initializer_and_mutator(
@@ -68,9 +70,10 @@ impl<E: EthSpec> InteractiveTester<E> {
         validator_count: usize,
         initializer: Option<Initializer<E>>,
         mutator: Option<Mutator<E>>,
+        config: Config,
     ) -> Self {
         let mut harness_builder = BeaconChainHarness::builder(E::default())
-            .spec_or_default(spec)
+            .spec_or_default(spec.map(Arc::new))
             .logger(test_logger())
             .mock_execution_layer();
 
@@ -93,12 +96,14 @@ impl<E: EthSpec> InteractiveTester<E> {
         let harness = harness_builder.build();
 
         let ApiServer {
+            ctx,
             server,
             listening_socket,
             network_rx,
             ..
-        } = create_api_server(
+        } = create_api_server_with_config(
             harness.chain.clone(),
+            config,
             &harness.runtime,
             harness.logger().clone(),
         )
@@ -117,6 +122,7 @@ impl<E: EthSpec> InteractiveTester<E> {
         );
 
         Self {
+            ctx,
             harness,
             client,
             network_rx,
@@ -128,7 +134,16 @@ pub async fn create_api_server<T: BeaconChainTypes>(
     chain: Arc<BeaconChain<T>>,
     test_runtime: &TestRuntime,
     log: Logger,
-) -> ApiServer<T::EthSpec, impl Future<Output = ()>> {
+) -> ApiServer<T, impl Future<Output = ()>> {
+    create_api_server_with_config(chain, Config::default(), test_runtime, log).await
+}
+
+pub async fn create_api_server_with_config<T: BeaconChainTypes>(
+    chain: Arc<BeaconChain<T>>,
+    http_config: Config,
+    test_runtime: &TestRuntime,
+    log: Logger,
+) -> ApiServer<T, impl Future<Output = ()>> {
     // Use port 0 to allocate a new unused port.
     let port = 0;
 
@@ -141,13 +156,16 @@ pub async fn create_api_server<T: BeaconChainTypes>(
         syncnets: EnrSyncCommitteeBitfield::<T::EthSpec>::default(),
     });
     let enr_key = CombinedKey::generate_secp256k1();
-    let enr = EnrBuilder::new("v4").build(&enr_key).unwrap();
+    let enr = Enr::builder().build(&enr_key).unwrap();
+    let network_config = Arc::new(NetworkConfig::default());
     let network_globals = Arc::new(NetworkGlobals::new(
         enr.clone(),
         meta_data,
         vec![],
         false,
         &log,
+        network_config,
+        chain.spec.clone(),
     ));
 
     // Only a peer manager can add peers, so we create a dummy manager.
@@ -190,6 +208,7 @@ pub async fn create_api_server<T: BeaconChainTypes>(
     } = BeaconProcessorChannels::new(&beacon_processor_config);
 
     let beacon_processor_send = beacon_processor_tx;
+    let reprocess_send = work_reprocessing_tx.clone();
     BeaconProcessor {
         network_globals: network_globals.clone(),
         executor: test_runtime.task_executor.clone(),
@@ -204,28 +223,39 @@ pub async fn create_api_server<T: BeaconChainTypes>(
         None,
         chain.slot_clock.clone(),
         chain.spec.maximum_gossip_clock_disparity(),
+        BeaconProcessorQueueLengths::from_state(
+            &chain.canonical_head.cached_head().snapshot.beacon_state,
+            &chain.spec,
+        )
+        .unwrap(),
     )
     .unwrap();
 
     let ctx = Arc::new(Context {
+        // Override several config fields with defaults. If these need to be tweaked in future
+        // we could remove these overrides.
         config: Config {
             enabled: true,
             listen_port: port,
             data_dir: std::path::PathBuf::from(DEFAULT_ROOT_DIR),
-            ..Config::default()
+            enable_light_client_server: true,
+            ..http_config
         },
         chain: Some(chain),
         network_senders: Some(network_senders),
         network_globals: Some(network_globals),
         beacon_processor_send: Some(beacon_processor_send),
+        beacon_processor_reprocess_send: Some(reprocess_send),
         eth1_service: Some(eth1_service),
         sse_logging_components: None,
         log,
     });
 
-    let (listening_socket, server) = crate::serve(ctx, test_runtime.task_executor.exit()).unwrap();
+    let (listening_socket, server) =
+        crate::serve(ctx.clone(), test_runtime.task_executor.exit()).unwrap();
 
     ApiServer {
+        ctx,
         server,
         listening_socket,
         network_rx: network_receivers,

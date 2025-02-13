@@ -16,6 +16,7 @@ use validator_client::ProductionValidatorClient;
 use validator_dir::insecure_keys::build_deterministic_validator_dirs;
 
 pub use beacon_node::{ClientConfig, ClientGenesis, ProductionClient};
+pub use beacon_node_fallback::ApiTopic;
 pub use environment;
 pub use eth2;
 pub use execution_layer::test_utils::{
@@ -103,8 +104,6 @@ pub fn testing_client_config() -> ClientConfig {
     client_config.http_api.enabled = true;
     client_config.http_api.listen_port = 0;
 
-    client_config.dummy_eth1_backend = true;
-
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("should get system time")
@@ -181,8 +180,8 @@ impl ValidatorFiles {
 /// is _local_ to this process).
 ///
 /// Intended for use in testing and simulation. Not for production.
-pub struct LocalValidatorClient<T: EthSpec> {
-    pub client: ProductionValidatorClient<T>,
+pub struct LocalValidatorClient<E: EthSpec> {
+    pub client: ProductionValidatorClient<E>,
     pub files: ValidatorFiles,
 }
 
@@ -250,7 +249,7 @@ impl<E: EthSpec> LocalExecutionNode<E> {
             panic!("Failed to write jwt file {}", e);
         }
         Self {
-            server: MockServer::new_with_config(&context.executor.handle().unwrap(), config),
+            server: MockServer::new_with_config(&context.executor.handle().unwrap(), config, None),
             datadir,
         }
     }

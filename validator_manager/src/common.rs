@@ -1,3 +1,4 @@
+pub use account_utils::STDIN_INPUTS_FLAG;
 use account_utils::{strip_off_newlines, ZeroizeString};
 use eth2::lighthouse_vc::std_types::{InterchangeJsonStr, KeystoreJsonStr};
 use eth2::{
@@ -15,7 +16,6 @@ use tree_hash::TreeHash;
 use types::*;
 
 pub const IGNORE_DUPLICATES_FLAG: &str = "ignore-duplicates";
-pub const STDIN_INPUTS_FLAG: &str = "stdin-inputs";
 pub const COUNT_FLAG: &str = "count";
 
 /// When the `ethereum/staking-deposit-cli` tool generates deposit data JSON, it adds a
@@ -46,6 +46,8 @@ pub struct ValidatorSpecification {
     pub fee_recipient: Option<Address>,
     pub gas_limit: Option<u64>,
     pub builder_proposals: Option<bool>,
+    pub builder_boost_factor: Option<u64>,
+    pub prefer_builder_proposals: Option<bool>,
     pub enabled: Option<bool>,
 }
 
@@ -64,6 +66,8 @@ impl ValidatorSpecification {
             gas_limit,
             builder_proposals,
             enabled,
+            builder_boost_factor,
+            prefer_builder_proposals,
         } = self;
 
         let voting_public_key = voting_keystore
@@ -136,6 +140,8 @@ impl ValidatorSpecification {
                     enabled,
                     gas_limit,
                     builder_proposals,
+                    builder_boost_factor,
+                    prefer_builder_proposals,
                     None, // Grafitti field is not maintained between validator moves.
                 )
                 .await

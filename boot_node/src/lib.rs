@@ -14,8 +14,8 @@ const LOG_CHANNEL_SIZE: usize = 2048;
 
 /// Run the bootnode given the CLI configuration.
 pub fn run(
-    lh_matches: &ArgMatches<'_>,
-    bn_matches: &ArgMatches<'_>,
+    lh_matches: &ArgMatches,
+    bn_matches: &ArgMatches,
     eth_spec_id: EthSpecId,
     eth2_network_config: &Eth2NetworkConfig,
     debug_level: String,
@@ -48,11 +48,8 @@ pub fn run(
         log::Level::Error => drain.filter_level(Level::Error),
     };
 
-    let logger = Logger::root(drain.fuse(), o!());
-    let _scope_guard = slog_scope::set_global_logger(logger);
-    slog_stdlog::init_with_level(debug_level).unwrap();
+    let log = Logger::root(drain.fuse(), o!());
 
-    let log = slog_scope::logger();
     // Run the main function emitting any errors
     if let Err(e) = match eth_spec_id {
         EthSpecId::Minimal => {
@@ -69,9 +66,9 @@ pub fn run(
     }
 }
 
-fn main<T: EthSpec>(
-    lh_matches: &ArgMatches<'_>,
-    bn_matches: &ArgMatches<'_>,
+fn main<E: EthSpec>(
+    lh_matches: &ArgMatches,
+    bn_matches: &ArgMatches,
     eth2_network_config: &Eth2NetworkConfig,
     log: slog::Logger,
 ) -> Result<(), String> {
@@ -82,7 +79,7 @@ fn main<T: EthSpec>(
         .map_err(|e| format!("Failed to build runtime: {}", e))?;
 
     // Run the boot node
-    runtime.block_on(server::run::<T>(
+    runtime.block_on(server::run::<E>(
         lh_matches,
         bn_matches,
         eth2_network_config,
