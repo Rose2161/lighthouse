@@ -1,15 +1,19 @@
 //! Tests for API behaviour across fork boundaries.
+use beacon_chain::custody_context::NodeCustodyType;
 use beacon_chain::{
-    test_utils::{RelativeSyncCommittee, DEFAULT_ETH1_BLOCK_HASH, HARNESS_GENESIS_TIME},
     StateSkipConfig,
+    test_utils::{DEFAULT_ETH1_BLOCK_HASH, HARNESS_GENESIS_TIME, RelativeSyncCommittee},
 };
+use bls::PublicKey;
 use eth2::types::{IndexedErrorMessage, StateId, SyncSubcommittee};
-use genesis::{bls_withdrawal_credentials, interop_genesis_state_with_withdrawal_credentials};
+use execution_layer::test_utils::generate_genesis_header;
+use fixed_bytes::FixedBytesExtended;
+use genesis::{InteropGenesisBuilder, bls_withdrawal_credentials};
 use http_api::test_utils::*;
 use std::collections::HashSet;
 use types::{
-    test_utils::{generate_deterministic_keypair, generate_deterministic_keypairs},
     Address, ChainSpec, Epoch, EthSpec, Hash256, MinimalEthSpec, Slot,
+    test_utils::{generate_deterministic_keypair, generate_deterministic_keypairs},
 };
 
 type E = MinimalEthSpec;
@@ -53,14 +57,9 @@ async fn sync_committee_duties_across_fork() {
     // If there's a skip slot at the fork slot, the endpoint should return duties, even
     // though the head state hasn't transitioned yet.
     let fork_slot = fork_epoch.start_slot(E::slots_per_epoch());
-    let (genesis_state, genesis_state_root) = harness.get_current_state_and_root();
+    let genesis_state = harness.get_current_state();
     let (_, state) = harness
-        .add_attested_block_at_slot(
-            fork_slot - 1,
-            genesis_state,
-            genesis_state_root,
-            &all_validators,
-        )
+        .add_attested_block_at_slot(fork_slot - 1, genesis_state, &all_validators)
         .await
         .unwrap();
 
@@ -75,9 +74,8 @@ async fn sync_committee_duties_across_fork() {
     assert_eq!(sync_duties.len(), E::sync_committee_size());
 
     // After applying a block at the fork slot the duties should remain unchanged.
-    let state_root = state.canonical_root();
     harness
-        .add_attested_block_at_slot(fork_slot, state, state_root, &all_validators)
+        .add_attested_block_at_slot(fork_slot, state, &all_validators)
         .await
         .unwrap();
 
@@ -127,17 +125,18 @@ async fn attestations_across_fork_with_skip_slots() {
     let all_validators = harness.get_all_validators();
 
     let fork_slot = fork_epoch.start_slot(E::slots_per_epoch());
-    let fork_state = harness
+    let mut fork_state = harness
         .chain
         .state_at_slot(fork_slot, StateSkipConfig::WithStateRoots)
         .unwrap();
+    let fork_state_root = fork_state.update_tree_hash_cache().unwrap();
 
     harness.set_current_slot(fork_slot);
 
     let attestations = harness.make_attestations(
         &all_validators,
         &fork_state,
-        fork_state.canonical_root(),
+        fork_state_root,
         (*fork_state.get_block_root(fork_slot - 1).unwrap()).into(),
         fork_slot,
     );
@@ -147,9 +146,41 @@ async fn attestations_across_fork_with_skip_slots() {
         .flat_map(|(atts, _)| atts.iter().map(|(att, _)| att.clone()))
         .collect::<Vec<_>>();
 
+    let unaggregated_attestations = unaggregated_attestations
+        .into_iter()
+        .map(|attn| {
+            let aggregation_bits = attn.get_aggregation_bits();
+
+            if aggregation_bits.len() != 1 {
+                panic!("Must be an unaggregated attestation")
+            }
+
+            let aggregation_bit = *aggregation_bits.first().unwrap();
+
+            let committee = fork_state
+                .get_beacon_committee(attn.data().slot, attn.committee_index().unwrap())
+                .unwrap();
+
+            let attester_index = committee
+                .committee
+                .iter()
+                .enumerate()
+                .find_map(|(i, &index)| {
+                    if aggregation_bit as usize == i {
+                        return Some(index);
+                    }
+                    None
+                })
+                .unwrap();
+            attn.to_single_attestation_with_attester_index(attester_index as u64)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
     assert!(!unaggregated_attestations.is_empty());
+    let fork_name = harness.spec.fork_name_at_slot::<E>(fork_slot);
     client
-        .post_beacon_pool_attestations(&unaggregated_attestations)
+        .post_beacon_pool_attestations_v2::<E>(unaggregated_attestations, fork_name)
         .await
         .unwrap();
 
@@ -160,7 +191,11 @@ async fn attestations_across_fork_with_skip_slots() {
     assert!(!signed_aggregates.is_empty());
 
     client
-        .post_validator_aggregate_and_proof(&signed_aggregates)
+        .post_validator_aggregate_and_proof_v1(&signed_aggregates)
+        .await
+        .unwrap();
+    client
+        .post_validator_aggregate_and_proof_v2(&signed_aggregates, fork_name)
         .await
         .unwrap();
 }
@@ -254,14 +289,9 @@ async fn sync_committee_indices_across_fork() {
     // If there's a skip slot at the fork slot, the endpoint will return a 400 until a block is
     // applied.
     let fork_slot = fork_epoch.start_slot(E::slots_per_epoch());
-    let (genesis_state, genesis_state_root) = harness.get_current_state_and_root();
+    let genesis_state = harness.get_current_state();
     let (_, state) = harness
-        .add_attested_block_at_slot(
-            fork_slot - 1,
-            genesis_state,
-            genesis_state_root,
-            &all_validators,
-        )
+        .add_attested_block_at_slot(fork_slot - 1, genesis_state, &all_validators)
         .await
         .unwrap();
 
@@ -293,9 +323,8 @@ async fn sync_committee_indices_across_fork() {
 
     // Once the head is updated it should be useable for requests, including in the next sync
     // committee period.
-    let state_root = state.canonical_root();
     harness
-        .add_attested_block_at_slot(fork_slot + 1, state, state_root, &all_validators)
+        .add_attested_block_at_slot(fork_slot + 1, state, &all_validators)
         .await
         .unwrap();
 
@@ -339,34 +368,46 @@ fn assert_server_indexed_error(error: eth2::Error, status_code: u16, indices: Ve
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bls_to_execution_changes_update_all_around_capella_fork() {
-    let validator_count = 128;
+    const VALIDATOR_COUNT: usize = 128;
     let fork_epoch = Epoch::new(2);
     let spec = capella_spec(fork_epoch);
     let max_bls_to_execution_changes = E::max_bls_to_execution_changes();
 
     // Use a genesis state with entirely BLS withdrawal credentials.
-    // Offset keypairs by `validator_count` to create keys distinct from the signing keys.
-    let validator_keypairs = generate_deterministic_keypairs(validator_count);
-    let withdrawal_keypairs = (0..validator_count)
-        .map(|i| Some(generate_deterministic_keypair(i + validator_count)))
+    // Offset keypairs by `VALIDATOR_COUNT` to create keys distinct from the signing keys.
+    let validator_keypairs = generate_deterministic_keypairs(VALIDATOR_COUNT);
+    let withdrawal_keypairs = (0..VALIDATOR_COUNT)
+        .map(|i| Some(generate_deterministic_keypair(i + VALIDATOR_COUNT)))
         .collect::<Vec<_>>();
-    let withdrawal_credentials = withdrawal_keypairs
-        .iter()
-        .map(|keypair| bls_withdrawal_credentials(&keypair.as_ref().unwrap().pk, &spec))
-        .collect::<Vec<_>>();
-    let genesis_state = interop_genesis_state_with_withdrawal_credentials(
-        &validator_keypairs,
-        &withdrawal_credentials,
-        HARNESS_GENESIS_TIME,
-        Hash256::from_slice(DEFAULT_ETH1_BLOCK_HASH),
-        None,
-        &spec,
-    )
-    .unwrap();
+
+    fn withdrawal_credentials_fn<'a>(
+        index: usize,
+        _: &'a PublicKey,
+        spec: &'a ChainSpec,
+    ) -> Hash256 {
+        // It is a bit inefficient to regenerate the whole keypair here, but this is a workaround.
+        // `InteropGenesisBuilder` requires the `withdrawal_credentials_fn` to have
+        // a `'static` lifetime.
+        let keypair = generate_deterministic_keypair(index + VALIDATOR_COUNT);
+        bls_withdrawal_credentials(&keypair.pk, spec)
+    }
+
+    let header = generate_genesis_header(&spec);
+
+    let genesis_state = InteropGenesisBuilder::new()
+        .set_opt_execution_payload_header(header)
+        .set_withdrawal_credentials_fn(Box::new(withdrawal_credentials_fn))
+        .build_genesis_state(
+            &validator_keypairs,
+            HARNESS_GENESIS_TIME,
+            Hash256::from_slice(DEFAULT_ETH1_BLOCK_HASH),
+            &spec,
+        )
+        .unwrap();
 
     let tester = InteractiveTester::<E>::new_with_initializer_and_mutator(
         Some(spec.clone()),
-        validator_count,
+        VALIDATOR_COUNT,
         Some(Box::new(|harness_builder| {
             harness_builder
                 .keypairs(validator_keypairs)
@@ -374,6 +415,9 @@ async fn bls_to_execution_changes_update_all_around_capella_fork() {
                 .genesis_state_ephemeral_store(genesis_state)
         })),
         None,
+        Default::default(),
+        true,
+        NodeCustodyType::Fullnode,
     )
     .await;
     let harness = &tester.harness;
@@ -412,7 +456,7 @@ async fn bls_to_execution_changes_update_all_around_capella_fork() {
             let pubkey = &harness.get_withdrawal_keypair(validator_index).pk;
             // And the wrong secret key.
             let secret_key = &harness
-                .get_withdrawal_keypair((validator_index + 1) % validator_count as u64)
+                .get_withdrawal_keypair((validator_index + 1) % VALIDATOR_COUNT as u64)
                 .sk;
             harness.make_bls_to_execution_change_with_keys(
                 validator_index,
@@ -424,7 +468,7 @@ async fn bls_to_execution_changes_update_all_around_capella_fork() {
         .collect::<Vec<_>>();
 
     // Submit some changes before Capella. Just enough to fill two blocks.
-    let num_pre_capella = validator_count / 4;
+    let num_pre_capella = VALIDATOR_COUNT / 4;
     let blocks_filled_pre_capella = 2;
     assert_eq!(
         num_pre_capella,
@@ -479,7 +523,7 @@ async fn bls_to_execution_changes_update_all_around_capella_fork() {
     );
 
     // Add Capella blocks which should be full of BLS to execution changes.
-    for i in 0..validator_count / max_bls_to_execution_changes {
+    for i in 0..VALIDATOR_COUNT / max_bls_to_execution_changes {
         let head_block_root = harness.extend_slots(1).await;
         let head_block = harness
             .chain
@@ -525,7 +569,7 @@ async fn bls_to_execution_changes_update_all_around_capella_fork() {
             assert_server_indexed_error(
                 error,
                 400,
-                (validator_count..3 * validator_count).collect(),
+                (VALIDATOR_COUNT..3 * VALIDATOR_COUNT).collect(),
             );
         }
     }

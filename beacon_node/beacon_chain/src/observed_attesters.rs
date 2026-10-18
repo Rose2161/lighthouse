@@ -19,23 +19,22 @@ use bitvec::vec::BitVec;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::marker::PhantomData;
-use types::slot_data::SlotData;
-use types::{Epoch, EthSpec, Hash256, Slot, Unsigned};
+use typenum::Unsigned;
+use types::SlotData;
+use types::{Epoch, EthSpec, Hash256, Slot};
 
 /// The maximum capacity of the `AutoPruningEpochContainer`.
 ///
-/// Fits the next, current and previous epochs. We require the next epoch due to the
-/// `MAXIMUM_GOSSIP_CLOCK_DISPARITY`. We require the previous epoch since the specification
-/// declares:
+/// If the current epoch is N, this fits epoch N + 1, N, N - 1, and N - 2. We require the next epoch due
+/// to the `MAXIMUM_GOSSIP_CLOCK_DISPARITY`. We require the N - 2 epoch since the specification declares:
 ///
 /// ```ignore
-/// aggregate.data.slot + ATTESTATION_PROPAGATION_SLOT_RANGE
-///      >= current_slot >= aggregate.data.slot
+/// the epoch of `aggregate.data.slot` is either the current or previous epoch
 /// ```
 ///
-/// This means that during the current epoch we will always accept an attestation
-/// from at least one slot in the previous epoch.
-pub const MAX_CACHED_EPOCHS: u64 = 3;
+/// This means that during the current epoch we will always accept an attestation from
+/// at least one slot in the epoch prior to the previous epoch.
+pub const MAX_CACHED_EPOCHS: u64 = 4;
 
 pub type ObservedAttesters<E> = AutoPruningEpochContainer<EpochBitfield, E>;
 pub type ObservedSyncContributors<E> =
@@ -43,6 +42,8 @@ pub type ObservedSyncContributors<E> =
 pub type ObservedAggregators<E> = AutoPruningEpochContainer<EpochHashSet, E>;
 pub type ObservedSyncAggregators<E> =
     AutoPruningSlotContainer<SlotSubcommitteeIndex, (), SyncAggregatorSlotHashSet, E>;
+pub type ObservedPayloadAttesters<E> =
+    AutoPruningSlotContainer<Slot, (), PayloadAttesterSlotHashSet<E>, E>;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -132,7 +133,7 @@ impl Item<()> for EpochBitfield {
     fn get(&self, validator_index: usize) -> Option<()> {
         self.bitfield
             .get(validator_index)
-            .map_or(false, |bit| *bit)
+            .is_some_and(|bit| *bit)
             .then_some(())
     }
 }
@@ -256,6 +257,46 @@ impl Item<()> for SyncAggregatorSlotHashSet {
     }
 }
 
+/// Stores a `HashSet` of validator indices that have sent a payload attestation gossip
+/// message during a slot.
+pub struct PayloadAttesterSlotHashSet<E> {
+    set: HashSet<usize>,
+    phantom: PhantomData<E>,
+}
+
+impl<E: EthSpec> Item<()> for PayloadAttesterSlotHashSet<E> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            set: HashSet::with_capacity(capacity),
+            phantom: PhantomData,
+        }
+    }
+
+    /// Defaults to `PTC_SIZE`, the maximum number of payload attesters per slot.
+    fn default_capacity() -> usize {
+        E::ptc_size()
+    }
+
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    fn validator_count(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Inserts the `validator_index` in the set. Returns `true` if the `validator_index` was
+    /// already in the set.
+    fn insert(&mut self, validator_index: usize, _value: ()) -> bool {
+        !self.set.insert(validator_index)
+    }
+
+    /// Returns `true` if the `validator_index` is in the set.
+    fn get(&self, validator_index: usize) -> Option<()> {
+        self.set.contains(&validator_index).then_some(())
+    }
+}
+
 /// A container that stores some number of `T` items.
 ///
 /// This container is "auto-pruning" since it gets an idea of the current slot by which
@@ -338,7 +379,7 @@ impl<T: Item<()>, E: EthSpec> AutoPruningEpochContainer<T, E> {
         let exists = self
             .items
             .get(&epoch)
-            .map_or(false, |item| item.get(validator_index).is_some());
+            .is_some_and(|item| item.get(validator_index).is_some());
 
         Ok(exists)
     }
@@ -621,6 +662,7 @@ impl SlotSubcommitteeIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fixed_bytes::FixedBytesExtended;
 
     type E = types::MainnetEthSpec;
 
@@ -634,18 +676,24 @@ mod tests {
         let value = Hash256::zero();
 
         // Assert there is no entry.
-        assert!(store
-            .observation_for_validator(key, validator_index)
-            .unwrap()
-            .is_none());
-        assert!(!store
-            .validator_has_been_observed(key, validator_index)
-            .unwrap());
+        assert!(
+            store
+                .observation_for_validator(key, validator_index)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .validator_has_been_observed(key, validator_index)
+                .unwrap()
+        );
 
         // Add an entry.
-        assert!(!store
-            .observe_validator(key, validator_index, value)
-            .unwrap());
+        assert!(
+            !store
+                .observe_validator(key, validator_index, value)
+                .unwrap()
+        );
 
         // Assert there is a correct entry.
         assert_eq!(
@@ -654,9 +702,11 @@ mod tests {
                 .unwrap(),
             Some(value)
         );
-        assert!(store
-            .validator_has_been_observed(key, validator_index)
-            .unwrap());
+        assert!(
+            store
+                .validator_has_been_observed(key, validator_index)
+                .unwrap()
+        );
 
         let alternate_value = Hash256::from_low_u64_be(1);
 

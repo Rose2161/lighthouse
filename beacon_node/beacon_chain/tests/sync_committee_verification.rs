@@ -2,36 +2,41 @@
 
 use beacon_chain::sync_committee_verification::{Error as SyncCommitteeError, SyncCommitteeData};
 use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType, RelativeSyncCommittee};
+use bls::{AggregateSignature, Keypair, SecretKey};
+use fixed_bytes::FixedBytesExtended;
 use int_to_bytes::int_to_bytes32;
-use lazy_static::lazy_static;
 use safe_arith::SafeArith;
 use state_processing::{
-    per_block_processing::{altair::sync_committee::process_sync_aggregate, VerifySignatures},
+    per_block_processing::{VerifySignatures, altair::sync_committee::process_sync_aggregate},
     state_advance::complete_state_advance,
 };
+use std::sync::LazyLock;
 use store::{SignedContributionAndProof, SyncCommitteeMessage};
 use tree_hash::TreeHash;
+use typenum::Unsigned;
 use types::consts::altair::SYNC_COMMITTEE_SUBNET_COUNT;
 use types::{
-    AggregateSignature, Epoch, EthSpec, Hash256, Keypair, MainnetEthSpec, SecretKey, Slot,
-    SyncContributionData, SyncSelectionProof, SyncSubnetId, Unsigned,
+    Epoch, EthSpec, Hash256, MainnetEthSpec, Slot, SyncContributionData, SyncSelectionProof,
+    SyncSubnetId,
 };
 
 pub type E = MainnetEthSpec;
 
 pub const VALIDATOR_COUNT: usize = 256;
 
-lazy_static! {
-    /// A cached set of keys.
-    static ref KEYPAIRS: Vec<Keypair> = types::test_utils::generate_deterministic_keypairs(VALIDATOR_COUNT);
-}
+// When set to true, cache any states fetched from the db.
+pub const CACHE_STATE_IN_TESTS: bool = true;
+
+/// A cached set of keys.
+static KEYPAIRS: LazyLock<Vec<Keypair>> =
+    LazyLock::new(|| types::test_utils::generate_deterministic_keypairs(VALIDATOR_COUNT));
 
 /// Returns a beacon chain harness.
 fn get_harness(validator_count: usize) -> BeaconChainHarness<EphemeralHarnessType<E>> {
     let mut spec = E::default_spec();
     spec.altair_fork_epoch = Some(Epoch::new(0));
     let harness = BeaconChainHarness::builder(MainnetEthSpec)
-        .spec(spec)
+        .spec(spec.into())
         .keypairs(KEYPAIRS[0..validator_count].to_vec())
         .fresh_ephemeral_store()
         .mock_execution_layer()
@@ -74,7 +79,7 @@ fn get_valid_sync_committee_message_for_block(
     let head_state = harness.chain.head_beacon_state_cloned();
     let (signature, _) = harness
         .make_sync_committee_messages(&head_state, block_root, slot, relative_sync_committee)
-        .get(0)
+        .first()
         .expect("sync messages should exist")
         .get(message_index)
         .expect("first sync message should exist")
@@ -105,7 +110,7 @@ fn get_valid_sync_contribution(
     );
 
     let (_, contribution_opt) = sync_contributions
-        .get(0)
+        .first()
         .expect("sync contributions should exist");
     let contribution = contribution_opt
         .as_ref()
@@ -180,7 +185,6 @@ async fn aggregated_gossip_verification() {
     harness
         .add_attested_blocks_at_slots(
             state,
-            Hash256::zero(),
             &[Slot::new(1), Slot::new(2)],
             (0..VALIDATOR_COUNT).collect::<Vec<_>>().as_slice(),
         )
@@ -318,7 +322,6 @@ async fn aggregated_gossip_verification() {
      * The contribution_and_proof.selection_proof is a valid signature of the `SyncAggregatorSelectionData`
      * derived from the contribution by the validator with index `contribution_and_proof.aggregator_index`.
      */
-
     assert_invalid!(
         "aggregate with bad selection proof signature",
         {
@@ -354,7 +357,6 @@ async fn aggregated_gossip_verification() {
      * derived from the participation info in `aggregation_bits` for the subcommittee specified by
      * the `contribution.subcommittee_index`.
      */
-
     assert_invalid!(
         "aggregate with bad aggregate signature",
         {
@@ -450,6 +452,7 @@ async fn aggregated_gossip_verification() {
         root: contribution.beacon_block_root,
         subcommittee_index: contribution.subcommittee_index,
     };
+
     assert_invalid!(
         "aggregate that has already been seen",
         valid_aggregate.clone(),
@@ -491,7 +494,7 @@ async fn aggregated_gossip_verification() {
     );
 
     harness
-        .add_attested_block_at_slot(target_slot, state, Hash256::zero(), &[])
+        .add_attested_block_at_slot(target_slot, state, &[])
         .await
         .expect("should add block");
 
@@ -515,7 +518,6 @@ async fn unaggregated_gossip_verification() {
     harness
         .add_attested_blocks_at_slots(
             state,
-            Hash256::zero(),
             &[Slot::new(1), Slot::new(2)],
             (0..VALIDATOR_COUNT).collect::<Vec<_>>().as_slice(),
         )
@@ -757,7 +759,10 @@ async fn unaggregated_gossip_verification() {
 
         // Load the block and state for the given root.
         let block = chain.get_block(&root).await.unwrap().unwrap();
-        let mut state = chain.get_state(&block.state_root(), None).unwrap().unwrap();
+        let mut state = chain
+            .get_state(&block.state_root(), None, CACHE_STATE_IN_TESTS)
+            .unwrap()
+            .unwrap();
 
         // Advance the state to simulate a pre-state for block production.
         let slot = valid_sync_committee_message.slot + 1;
@@ -794,7 +799,7 @@ async fn unaggregated_gossip_verification() {
     );
 
     harness
-        .add_attested_block_at_slot(target_slot, state, Hash256::zero(), &[])
+        .add_attested_block_at_slot(target_slot, state, &[])
         .await
         .expect("should add block");
 

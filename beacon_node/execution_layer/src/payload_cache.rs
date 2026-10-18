@@ -1,19 +1,20 @@
-use lru::LruCache;
+use eth2::types::FullPayloadContents;
+use hashlink::lru_cache::LruCache;
 use parking_lot::Mutex;
 use tree_hash::TreeHash;
-use types::{EthSpec, ExecutionPayload, Hash256};
+use types::{EthSpec, Hash256};
 
 pub const DEFAULT_PAYLOAD_CACHE_SIZE: usize = 10;
 
 /// A cache mapping execution payloads by tree hash roots.
-pub struct PayloadCache<T: EthSpec> {
-    payloads: Mutex<LruCache<PayloadCacheId, ExecutionPayload<T>>>,
+pub struct PayloadCache<E: EthSpec> {
+    payloads: Mutex<LruCache<PayloadCacheId, FullPayloadContents<E>>>,
 }
 
 #[derive(Hash, PartialEq, Eq)]
 struct PayloadCacheId(Hash256);
 
-impl<T: EthSpec> Default for PayloadCache<T> {
+impl<E: EthSpec> Default for PayloadCache<E> {
     fn default() -> Self {
         PayloadCache {
             payloads: Mutex::new(LruCache::new(DEFAULT_PAYLOAD_CACHE_SIZE)),
@@ -21,17 +22,17 @@ impl<T: EthSpec> Default for PayloadCache<T> {
     }
 }
 
-impl<T: EthSpec> PayloadCache<T> {
-    pub fn put(&self, payload: ExecutionPayload<T>) -> Option<ExecutionPayload<T>> {
-        let root = payload.tree_hash_root();
-        self.payloads.lock().put(PayloadCacheId(root), payload)
+impl<E: EthSpec> PayloadCache<E> {
+    pub fn put(&self, payload: FullPayloadContents<E>) -> Option<FullPayloadContents<E>> {
+        let root = payload.payload_ref().tree_hash_root();
+        self.payloads.lock().insert(PayloadCacheId(root), payload)
     }
 
-    pub fn pop(&self, root: &Hash256) -> Option<ExecutionPayload<T>> {
-        self.payloads.lock().pop(&PayloadCacheId(*root))
+    pub fn pop(&self, root: &Hash256) -> Option<FullPayloadContents<E>> {
+        self.payloads.lock().remove(&PayloadCacheId(*root))
     }
 
-    pub fn get(&self, hash: &Hash256) -> Option<ExecutionPayload<T>> {
+    pub fn get(&self, hash: &Hash256) -> Option<FullPayloadContents<E>> {
         self.payloads.lock().get(&PayloadCacheId(*hash)).cloned()
     }
 }

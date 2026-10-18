@@ -1,12 +1,14 @@
 use crate::{
-    interchange::{Interchange, SignedAttestation, SignedBlock},
-    test_utils::{pubkey, DEFAULT_GENESIS_VALIDATORS_ROOT},
     SigningRoot, SlashingDatabase,
+    test_utils::{DEFAULT_GENESIS_VALIDATORS_ROOT, pubkey},
 };
-use serde_derive::{Deserialize, Serialize};
+use bls::PublicKeyBytes;
+use eip_3076::{Interchange, SignedAttestation, SignedBlock};
+use fixed_bytes::FixedBytesExtended;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use tempfile::tempdir;
-use types::{Epoch, Hash256, PublicKeyBytes, Slot};
+use types::{Epoch, Hash256, Slot};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -33,6 +35,7 @@ pub struct TestBlock {
     pub slot: Slot,
     pub signing_root: Hash256,
     pub should_succeed: bool,
+    pub should_succeed_complete: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -43,6 +46,7 @@ pub struct TestAttestation {
     pub target_epoch: Epoch,
     pub signing_root: Hash256,
     pub should_succeed: bool,
+    pub should_succeed_complete: bool,
 }
 
 impl MultiTestCase {
@@ -67,10 +71,6 @@ impl MultiTestCase {
         let dir = tempdir().unwrap();
         let slashing_db_file = dir.path().join("slashing_protection.sqlite");
         let slashing_db = SlashingDatabase::create(&slashing_db_file).unwrap();
-
-        // Now that we are using implicit minification on import, we must always allow
-        // false positives.
-        let allow_false_positives = true;
 
         for test_case in &self.steps {
             // If the test case is marked as containing slashable data, then the spec allows us to
@@ -124,7 +124,7 @@ impl MultiTestCase {
                             i, self.name, safe
                         );
                     }
-                    Err(e) if block.should_succeed && !allow_false_positives => {
+                    Err(e) if block.should_succeed => {
                         panic!(
                             "block {} from `{}` failed when it should have succeeded: {:?}",
                             i, self.name, e
@@ -135,19 +135,22 @@ impl MultiTestCase {
             }
 
             for (i, att) in test_case.attestations.iter().enumerate() {
-                match slashing_db.check_and_insert_attestation_signing_root(
-                    &att.pubkey,
-                    att.source_epoch,
-                    att.target_epoch,
-                    SigningRoot::from(att.signing_root),
-                ) {
+                match slashing_db.with_transaction(|txn| {
+                    slashing_db.check_and_insert_attestation_signing_root(
+                        &att.pubkey,
+                        att.source_epoch,
+                        att.target_epoch,
+                        SigningRoot::from(att.signing_root),
+                        txn,
+                    )
+                }) {
                     Ok(safe) if !att.should_succeed => {
                         panic!(
                             "attestation {} from `{}` succeeded when it should have failed: {:?}",
                             i, self.name, safe
                         );
                     }
-                    Err(e) if att.should_succeed && !allow_false_positives => {
+                    Err(e) if att.should_succeed => {
                         panic!(
                             "attestation {} from `{}` failed when it should have succeeded: {:?}",
                             i, self.name, e
@@ -181,53 +184,65 @@ impl TestCase {
         self
     }
 
-    pub fn with_blocks(self, blocks: impl IntoIterator<Item = (usize, u64, bool)>) -> Self {
-        self.with_signing_root_blocks(
-            blocks
-                .into_iter()
-                .map(|(index, slot, should_succeed)| (index, slot, 0, should_succeed)),
-        )
+    pub fn with_blocks(self, blocks: impl IntoIterator<Item = (usize, u64, bool, bool)>) -> Self {
+        self.with_signing_root_blocks(blocks.into_iter().map(
+            |(index, slot, should_succeed, should_succeed_complete)| {
+                (index, slot, 0, should_succeed, should_succeed_complete)
+            },
+        ))
     }
 
     pub fn with_signing_root_blocks(
         mut self,
-        blocks: impl IntoIterator<Item = (usize, u64, u64, bool)>,
+        blocks: impl IntoIterator<Item = (usize, u64, u64, bool, bool)>,
     ) -> Self {
-        self.blocks.extend(
-            blocks
-                .into_iter()
-                .map(|(pk, slot, signing_root, should_succeed)| TestBlock {
+        self.blocks.extend(blocks.into_iter().map(
+            |(pk, slot, signing_root, should_succeed, should_succeed_complete)| {
+                assert!(
+                    !should_succeed || should_succeed_complete,
+                    "if should_succeed is true then should_succeed_complete must also be true"
+                );
+                TestBlock {
                     pubkey: pubkey(pk),
                     slot: Slot::new(slot),
                     signing_root: Hash256::from_low_u64_be(signing_root),
                     should_succeed,
-                }),
-        );
+                    should_succeed_complete,
+                }
+            },
+        ));
         self
     }
 
     pub fn with_attestations(
         self,
-        attestations: impl IntoIterator<Item = (usize, u64, u64, bool)>,
+        attestations: impl IntoIterator<Item = (usize, u64, u64, bool, bool)>,
     ) -> Self {
-        self.with_signing_root_attestations(
-            attestations
-                .into_iter()
-                .map(|(id, source, target, succeed)| (id, source, target, 0, succeed)),
-        )
+        self.with_signing_root_attestations(attestations.into_iter().map(
+            |(id, source, target, succeed, succeed_complete)| {
+                (id, source, target, 0, succeed, succeed_complete)
+            },
+        ))
     }
 
     pub fn with_signing_root_attestations(
         mut self,
-        attestations: impl IntoIterator<Item = (usize, u64, u64, u64, bool)>,
+        attestations: impl IntoIterator<Item = (usize, u64, u64, u64, bool, bool)>,
     ) -> Self {
         self.attestations.extend(attestations.into_iter().map(
-            |(pk, source, target, signing_root, should_succeed)| TestAttestation {
-                pubkey: pubkey(pk),
-                source_epoch: Epoch::new(source),
-                target_epoch: Epoch::new(target),
-                signing_root: Hash256::from_low_u64_be(signing_root),
-                should_succeed,
+            |(pk, source, target, signing_root, should_succeed, should_succeed_complete)| {
+                assert!(
+                    !should_succeed || should_succeed_complete,
+                    "if should_succeed is true then should_succeed_complete must also be true"
+                );
+                TestAttestation {
+                    pubkey: pubkey(pk),
+                    source_epoch: Epoch::new(source),
+                    target_epoch: Epoch::new(target),
+                    signing_root: Hash256::from_low_u64_be(signing_root),
+                    should_succeed,
+                    should_succeed_complete,
+                }
             },
         ));
         self
@@ -260,9 +275,11 @@ pub fn check_minification_invariants(interchange: &Interchange, minified: &Inter
             assert_eq!(mini_block.signing_root, None);
 
             // All original blocks should have slots <= the mini block.
-            assert!(original_blocks
-                .iter()
-                .all(|block| block.slot <= mini_block.slot));
+            assert!(
+                original_blocks
+                    .iter()
+                    .all(|block| block.slot <= mini_block.slot)
+            );
         }
 
         // Minified data should contain 1 attestation per validator, unless the validator never
@@ -279,10 +296,12 @@ pub fn check_minification_invariants(interchange: &Interchange, minified: &Inter
             let mini_attestation = minified_attestations.first().unwrap();
             assert_eq!(mini_attestation.signing_root, None);
 
-            assert!(original_attestations
-                .iter()
-                .all(|att| att.source_epoch <= mini_attestation.source_epoch
-                    && att.target_epoch <= mini_attestation.target_epoch));
+            assert!(
+                original_attestations
+                    .iter()
+                    .all(|att| att.source_epoch <= mini_attestation.source_epoch
+                        && att.target_epoch <= mini_attestation.target_epoch)
+            );
         }
     }
 }

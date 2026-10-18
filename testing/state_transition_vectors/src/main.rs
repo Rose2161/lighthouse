@@ -3,17 +3,16 @@ mod macros;
 mod exit;
 
 use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType};
-use lazy_static::lazy_static;
+use bls::Keypair;
 use ssz::Encode;
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use types::{
-    test_utils::generate_deterministic_keypairs, BeaconState, EthSpec, Keypair, SignedBeaconBlock,
-};
-use types::{Hash256, MainnetEthSpec, Slot};
+use std::sync::LazyLock;
+use types::{BeaconState, EthSpec, SignedBeaconBlock, test_utils::generate_deterministic_keypairs};
+use types::{MainnetEthSpec, Slot};
 
 type E = MainnetEthSpec;
 
@@ -45,10 +44,9 @@ pub struct TestVector {
     pub error: Option<String>,
 }
 
-lazy_static! {
-    /// A cached set of keys.
-    static ref KEYPAIRS: Vec<Keypair> = generate_deterministic_keypairs(VALIDATOR_COUNT);
-}
+/// A cached set of keys.
+static KEYPAIRS: LazyLock<Vec<Keypair>> =
+    LazyLock::new(|| generate_deterministic_keypairs(VALIDATOR_COUNT));
 
 async fn get_harness<E: EthSpec>(
     slot: Slot,
@@ -58,6 +56,7 @@ async fn get_harness<E: EthSpec>(
         .default_spec()
         .keypairs(KEYPAIRS[0..validator_count].to_vec())
         .fresh_ephemeral_store()
+        .mock_execution_layer()
         .build();
     let skip_to_slot = slot - SLOT_OFFSET;
     if skip_to_slot > Slot::new(0) {
@@ -65,7 +64,6 @@ async fn get_harness<E: EthSpec>(
         harness
             .add_attested_blocks_at_slots(
                 state,
-                Hash256::zero(),
                 (skip_to_slot.as_u64()..slot.as_u64())
                     .map(Slot::new)
                     .collect::<Vec<_>>()

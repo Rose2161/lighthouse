@@ -1,9 +1,17 @@
 use libp2p::gossipsub::{IdentTopic as Topic, TopicHash};
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use strum::AsRefStr;
-use types::{ForkName, SubnetId, SyncSubnetId};
+use typenum::Unsigned;
+use types::{
+    ChainSpec, EthSpec,
+    attestation::SubnetId,
+    data::{DataColumnSubnetId, all_data_column_sidecar_subnets_from_spec},
+    fork::ForkName,
+    sync_committee::SyncSubnetId,
+};
 
-use crate::Subnet;
+use crate::{NetworkConfig, Subnet};
 
 /// The gossipsub topic names.
 // These constants form a topic name of the form /TOPIC_PREFIX/TOPIC/ENCODING_POSTFIX
@@ -13,52 +21,119 @@ pub const SSZ_SNAPPY_ENCODING_POSTFIX: &str = "ssz_snappy";
 pub const BEACON_BLOCK_TOPIC: &str = "beacon_block";
 pub const BEACON_AGGREGATE_AND_PROOF_TOPIC: &str = "beacon_aggregate_and_proof";
 pub const BEACON_ATTESTATION_PREFIX: &str = "beacon_attestation_";
+pub const DATA_COLUMN_SIDECAR_PREFIX: &str = "data_column_sidecar_";
 pub const VOLUNTARY_EXIT_TOPIC: &str = "voluntary_exit";
 pub const PROPOSER_SLASHING_TOPIC: &str = "proposer_slashing";
 pub const ATTESTER_SLASHING_TOPIC: &str = "attester_slashing";
 pub const SIGNED_CONTRIBUTION_AND_PROOF_TOPIC: &str = "sync_committee_contribution_and_proof";
 pub const SYNC_COMMITTEE_PREFIX_TOPIC: &str = "sync_committee_";
 pub const BLS_TO_EXECUTION_CHANGE_TOPIC: &str = "bls_to_execution_change";
+pub const EXECUTION_PAYLOAD: &str = "execution_payload";
+pub const EXECUTION_PAYLOAD_BID: &str = "execution_payload_bid";
+pub const PAYLOAD_ATTESTATION: &str = "payload_attestation_message";
+pub const PROPOSER_PREFERENCES: &str = "proposer_preferences";
 pub const LIGHT_CLIENT_FINALITY_UPDATE: &str = "light_client_finality_update";
 pub const LIGHT_CLIENT_OPTIMISTIC_UPDATE: &str = "light_client_optimistic_update";
 
-pub const BASE_CORE_TOPICS: [GossipKind; 5] = [
-    GossipKind::BeaconBlock,
-    GossipKind::BeaconAggregateAndProof,
-    GossipKind::VoluntaryExit,
-    GossipKind::ProposerSlashing,
-    GossipKind::AttesterSlashing,
-];
+#[derive(Debug)]
+pub struct TopicConfig {
+    pub enable_light_client_server: bool,
+    pub subscribe_all_subnets: bool,
+    pub sampling_subnets: HashSet<DataColumnSubnetId>,
+}
 
-pub const ALTAIR_CORE_TOPICS: [GossipKind; 1] = [GossipKind::SignedContributionAndProof];
+/// Returns all the topics the node should subscribe at `fork_name`
+pub fn core_topics_to_subscribe<E: EthSpec>(
+    fork_name: ForkName,
+    opts: &TopicConfig,
+    spec: &ChainSpec,
+) -> Vec<GossipKind> {
+    let mut topics = vec![
+        GossipKind::BeaconBlock,
+        GossipKind::BeaconAggregateAndProof,
+        GossipKind::VoluntaryExit,
+        GossipKind::ProposerSlashing,
+        GossipKind::AttesterSlashing,
+    ];
 
-pub const CAPELLA_CORE_TOPICS: [GossipKind; 1] = [GossipKind::BlsToExecutionChange];
+    if opts.subscribe_all_subnets {
+        for i in 0..spec.attestation_subnet_count {
+            topics.push(GossipKind::Attestation(i.into()));
+        }
+    }
 
-pub const LIGHT_CLIENT_GOSSIP_TOPICS: [GossipKind; 2] = [
-    GossipKind::LightClientFinalityUpdate,
-    GossipKind::LightClientOptimisticUpdate,
-];
+    if fork_name.altair_enabled() {
+        topics.push(GossipKind::SignedContributionAndProof);
 
-/// Returns the core topics associated with each fork that are new to the previous fork
-pub fn fork_core_topics(fork_name: &ForkName) -> Vec<GossipKind> {
-    match fork_name {
-        ForkName::Base => BASE_CORE_TOPICS.to_vec(),
-        ForkName::Altair => ALTAIR_CORE_TOPICS.to_vec(),
-        ForkName::Merge => vec![],
-        ForkName::Capella => CAPELLA_CORE_TOPICS.to_vec(),
+        if opts.subscribe_all_subnets {
+            for i in 0..E::SyncCommitteeSubnetCount::to_u64() {
+                topics.push(GossipKind::SyncCommitteeMessage(i.into()));
+            }
+        }
+
+        if opts.enable_light_client_server {
+            topics.push(GossipKind::LightClientFinalityUpdate);
+            topics.push(GossipKind::LightClientOptimisticUpdate);
+        }
+    }
+
+    if fork_name.capella_enabled() {
+        topics.push(GossipKind::BlsToExecutionChange);
+    }
+
+    if fork_name.fulu_enabled() {
+        for subnet in &opts.sampling_subnets {
+            topics.push(GossipKind::DataColumnSidecar(*subnet));
+        }
+    }
+
+    if fork_name.gloas_enabled() {
+        topics.push(GossipKind::ExecutionPayload);
+        topics.push(GossipKind::ExecutionPayloadBid);
+        topics.push(GossipKind::PayloadAttestation);
+        topics.push(GossipKind::ProposerPreferences);
+    }
+
+    topics
+}
+
+/// Returns true if a given non-core `GossipTopic` MAY be subscribe at this fork.
+///
+/// For example: the `Attestation` topic is not subscribed as a core topic if
+/// subscribe_all_subnets = false` but we may subscribe to it outside of a fork
+/// boundary if the node is an aggregator.
+pub fn is_fork_non_core_topic(topic: &GossipTopic, _fork_name: ForkName) -> bool {
+    match topic.kind() {
+        // Node may be aggregator of attestation and sync_committee_message topics for all known
+        // forks
+        GossipKind::Attestation(_) | GossipKind::SyncCommitteeMessage(_) => true,
+        // All these topics are core-only
+        GossipKind::BeaconBlock
+        | GossipKind::BeaconAggregateAndProof
+        | GossipKind::DataColumnSidecar(_)
+        | GossipKind::VoluntaryExit
+        | GossipKind::ProposerSlashing
+        | GossipKind::AttesterSlashing
+        | GossipKind::SignedContributionAndProof
+        | GossipKind::BlsToExecutionChange
+        | GossipKind::ExecutionPayload
+        | GossipKind::ExecutionPayloadBid
+        | GossipKind::PayloadAttestation
+        | GossipKind::ProposerPreferences
+        | GossipKind::LightClientFinalityUpdate
+        | GossipKind::LightClientOptimisticUpdate => false,
     }
 }
 
-/// Returns all the topics that we need to subscribe to for a given fork
-/// including topics from older forks and new topics for the current fork.
-pub fn core_topics_to_subscribe(mut current_fork: ForkName) -> Vec<GossipKind> {
-    let mut topics = fork_core_topics(&current_fork);
-    while let Some(previous_fork) = current_fork.previous_fork() {
-        let previous_fork_topics = fork_core_topics(&previous_fork);
-        topics.extend(previous_fork_topics);
-        current_fork = previous_fork;
-    }
-    topics
+pub fn all_topics_at_fork<E: EthSpec>(fork: ForkName, spec: &ChainSpec) -> Vec<GossipKind> {
+    // Compute the worst case of all forks
+    let sampling_subnets = HashSet::from_iter(all_data_column_sidecar_subnets_from_spec(spec));
+    let opts = TopicConfig {
+        enable_light_client_server: true,
+        subscribe_all_subnets: true,
+        sampling_subnets,
+    };
+    core_topics_to_subscribe::<E>(fork, &opts, spec)
 }
 
 /// A gossipsub topic which encapsulates the type of messages that should be sent and received over
@@ -82,6 +157,8 @@ pub enum GossipKind {
     BeaconBlock,
     /// Topic for publishing aggregate attestations and proofs.
     BeaconAggregateAndProof,
+    /// Topic for publishing DataColumnSidecars.
+    DataColumnSidecar(DataColumnSubnetId),
     /// Topic for publishing raw attestations on a particular subnet.
     #[strum(serialize = "beacon_attestation")]
     Attestation(SubnetId),
@@ -98,10 +175,27 @@ pub enum GossipKind {
     SyncCommitteeMessage(SyncSubnetId),
     /// Topic for validator messages which change their withdrawal address.
     BlsToExecutionChange,
+    /// Topic for signed execution payload envelopes.
+    ExecutionPayload,
+    /// Topic for payload attestation messages.
+    PayloadAttestation,
+    /// Topic for signed execution payload bids.
+    ExecutionPayloadBid,
+    /// Topic for signed proposer preferences.
+    ProposerPreferences,
     /// Topic for publishing finality updates for light clients.
     LightClientFinalityUpdate,
     /// Topic for publishing optimistic updates for light clients.
     LightClientOptimisticUpdate,
+}
+
+impl GossipKind {
+    pub fn use_partial_messages(&self, config: &NetworkConfig) -> bool {
+        match self {
+            GossipKind::DataColumnSidecar(_) => config.enable_partial_columns,
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for GossipKind {
@@ -110,6 +204,9 @@ impl std::fmt::Display for GossipKind {
             GossipKind::Attestation(subnet_id) => write!(f, "beacon_attestation_{}", **subnet_id),
             GossipKind::SyncCommitteeMessage(subnet_id) => {
                 write!(f, "sync_committee_{}", **subnet_id)
+            }
+            GossipKind::DataColumnSidecar(column_subnet_id) => {
+                write!(f, "{}{}", DATA_COLUMN_SIDECAR_PREFIX, **column_subnet_id)
             }
             x => f.write_str(x.as_ref()),
         }
@@ -176,13 +273,14 @@ impl GossipTopic {
                 PROPOSER_SLASHING_TOPIC => GossipKind::ProposerSlashing,
                 ATTESTER_SLASHING_TOPIC => GossipKind::AttesterSlashing,
                 BLS_TO_EXECUTION_CHANGE_TOPIC => GossipKind::BlsToExecutionChange,
+                EXECUTION_PAYLOAD => GossipKind::ExecutionPayload,
+                EXECUTION_PAYLOAD_BID => GossipKind::ExecutionPayloadBid,
+                PAYLOAD_ATTESTATION => GossipKind::PayloadAttestation,
+                PROPOSER_PREFERENCES => GossipKind::ProposerPreferences,
                 LIGHT_CLIENT_FINALITY_UPDATE => GossipKind::LightClientFinalityUpdate,
                 LIGHT_CLIENT_OPTIMISTIC_UPDATE => GossipKind::LightClientOptimisticUpdate,
-                topic => match committee_topic_index(topic) {
-                    Some(subnet) => match subnet {
-                        Subnet::Attestation(s) => GossipKind::Attestation(s),
-                        Subnet::SyncCommittee(s) => GossipKind::SyncCommitteeMessage(s),
-                    },
+                topic => match subnet_topic_index(topic) {
+                    Some(kind) => kind,
                     None => return Err(format!("Unknown topic: {}", topic)),
                 },
             };
@@ -201,6 +299,7 @@ impl GossipTopic {
         match self.kind() {
             GossipKind::Attestation(subnet_id) => Some(Subnet::Attestation(*subnet_id)),
             GossipKind::SyncCommitteeMessage(subnet_id) => Some(Subnet::SyncCommittee(*subnet_id)),
+            GossipKind::DataColumnSidecar(subnet_id) => Some(Subnet::DataColumn(*subnet_id)),
             _ => None,
         }
     }
@@ -236,7 +335,14 @@ impl std::fmt::Display for GossipTopic {
             GossipKind::SyncCommitteeMessage(index) => {
                 format!("{}{}", SYNC_COMMITTEE_PREFIX_TOPIC, *index)
             }
+            GossipKind::DataColumnSidecar(column_subnet_id) => {
+                format!("{}{}", DATA_COLUMN_SIDECAR_PREFIX, *column_subnet_id)
+            }
             GossipKind::BlsToExecutionChange => BLS_TO_EXECUTION_CHANGE_TOPIC.into(),
+            GossipKind::ExecutionPayload => EXECUTION_PAYLOAD.into(),
+            GossipKind::PayloadAttestation => PAYLOAD_ATTESTATION.into(),
+            GossipKind::ExecutionPayloadBid => EXECUTION_PAYLOAD_BID.into(),
+            GossipKind::ProposerPreferences => PROPOSER_PREFERENCES.into(),
             GossipKind::LightClientFinalityUpdate => LIGHT_CLIENT_FINALITY_UPDATE.into(),
             GossipKind::LightClientOptimisticUpdate => LIGHT_CLIENT_OPTIMISTIC_UPDATE.into(),
         };
@@ -256,6 +362,7 @@ impl From<Subnet> for GossipKind {
         match subnet_id {
             Subnet::Attestation(s) => GossipKind::Attestation(s),
             Subnet::SyncCommittee(s) => GossipKind::SyncCommitteeMessage(s),
+            Subnet::DataColumn(s) => GossipKind::DataColumnSidecar(s),
         }
     }
 }
@@ -267,21 +374,19 @@ pub fn subnet_from_topic_hash(topic_hash: &TopicHash) -> Option<Subnet> {
     GossipTopic::decode(topic_hash.as_str()).ok()?.subnet_id()
 }
 
-// Determines if a string is an attestation or sync committee topic.
-fn committee_topic_index(topic: &str) -> Option<Subnet> {
-    if topic.starts_with(BEACON_ATTESTATION_PREFIX) {
-        return Some(Subnet::Attestation(SubnetId::new(
-            topic
-                .trim_start_matches(BEACON_ATTESTATION_PREFIX)
-                .parse::<u64>()
-                .ok()?,
+// Determines if the topic name is of an indexed topic.
+fn subnet_topic_index(topic: &str) -> Option<GossipKind> {
+    if let Some(index) = topic.strip_prefix(BEACON_ATTESTATION_PREFIX) {
+        return Some(GossipKind::Attestation(SubnetId::new(
+            index.parse::<u64>().ok()?,
         )));
-    } else if topic.starts_with(SYNC_COMMITTEE_PREFIX_TOPIC) {
-        return Some(Subnet::SyncCommittee(SyncSubnetId::new(
-            topic
-                .trim_start_matches(SYNC_COMMITTEE_PREFIX_TOPIC)
-                .parse::<u64>()
-                .ok()?,
+    } else if let Some(index) = topic.strip_prefix(SYNC_COMMITTEE_PREFIX_TOPIC) {
+        return Some(GossipKind::SyncCommitteeMessage(SyncSubnetId::new(
+            index.parse::<u64>().ok()?,
+        )));
+    } else if let Some(index) = topic.strip_prefix(DATA_COLUMN_SIDECAR_PREFIX) {
+        return Some(GossipKind::DataColumnSidecar(DataColumnSubnetId::new(
+            index.parse::<u64>().ok()?,
         )));
     }
     None
@@ -291,6 +396,7 @@ fn committee_topic_index(topic: &str) -> Option<Subnet> {
 mod tests {
     use super::GossipKind::*;
     use super::*;
+    use types::{Epoch, MainnetEthSpec as E};
 
     const GOOD_FORK_DIGEST: &str = "e1925f3b";
     const BAD_PREFIX: &str = "tezos";
@@ -415,14 +521,83 @@ mod tests {
         assert_eq!("attester_slashing", AttesterSlashing.as_ref());
     }
 
+    fn get_spec() -> ChainSpec {
+        let mut spec = E::default_spec();
+        spec.altair_fork_epoch = Some(Epoch::new(1));
+        spec.bellatrix_fork_epoch = Some(Epoch::new(2));
+        spec.capella_fork_epoch = Some(Epoch::new(3));
+        spec.deneb_fork_epoch = Some(Epoch::new(4));
+        spec.electra_fork_epoch = Some(Epoch::new(5));
+        spec.fulu_fork_epoch = Some(Epoch::new(6));
+        spec
+    }
+
+    fn get_sampling_subnets() -> HashSet<DataColumnSubnetId> {
+        HashSet::new()
+    }
+
+    fn get_topic_config(sampling_subnets: &HashSet<DataColumnSubnetId>) -> TopicConfig {
+        TopicConfig {
+            enable_light_client_server: false,
+            subscribe_all_subnets: false,
+            sampling_subnets: sampling_subnets.clone(),
+        }
+    }
+
+    #[test]
+    fn base_topics_are_always_active() {
+        let spec = get_spec();
+        let s = get_sampling_subnets();
+        let topic_config = get_topic_config(&s);
+        for fork in ForkName::list_all() {
+            assert!(
+                core_topics_to_subscribe::<E>(fork, &topic_config, &spec,)
+                    .contains(&GossipKind::BeaconBlock)
+            );
+        }
+    }
+
+    #[test]
+    fn columns_are_subscribed_in_peerdas() {
+        let spec = get_spec();
+        let s = HashSet::from_iter([0.into()]);
+        let topic_config = get_topic_config(&s);
+        assert!(
+            core_topics_to_subscribe::<E>(ForkName::Fulu, &topic_config, &spec)
+                .contains(&GossipKind::DataColumnSidecar(0.into()))
+        );
+    }
+
     #[test]
     fn test_core_topics_to_subscribe() {
-        let mut all_topics = Vec::new();
-        all_topics.extend(CAPELLA_CORE_TOPICS);
-        all_topics.extend(ALTAIR_CORE_TOPICS);
-        all_topics.extend(BASE_CORE_TOPICS);
-
+        let spec = get_spec();
+        let s = HashSet::from_iter([1, 2].map(DataColumnSubnetId::new));
+        let mut topic_config = get_topic_config(&s);
+        topic_config.enable_light_client_server = true;
         let latest_fork = *ForkName::list_all().last().unwrap();
-        assert_eq!(core_topics_to_subscribe(latest_fork), all_topics);
+        let topics = core_topics_to_subscribe::<E>(latest_fork, &topic_config, &spec);
+
+        let mut expected_topics = vec![
+            GossipKind::BeaconBlock,
+            GossipKind::BeaconAggregateAndProof,
+            GossipKind::VoluntaryExit,
+            GossipKind::ProposerSlashing,
+            GossipKind::AttesterSlashing,
+            GossipKind::SignedContributionAndProof,
+            GossipKind::LightClientFinalityUpdate,
+            GossipKind::LightClientOptimisticUpdate,
+            GossipKind::BlsToExecutionChange,
+        ];
+        for subnet in s {
+            expected_topics.push(GossipKind::DataColumnSidecar(subnet));
+        }
+        // Need to check all the topics exist in an order independent manner
+        for expected_topic in expected_topics {
+            assert!(
+                topics.contains(&expected_topic),
+                "Should contain {:?}",
+                expected_topic
+            );
+        }
     }
 }

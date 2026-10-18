@@ -5,7 +5,6 @@ _Documentation for protocol developers._
 This section lists Lighthouse-specific decisions that are not strictly spec'd and may be useful for
 other protocol developers wishing to interact with lighthouse.
 
-
 ## Custom ENR Fields
 
 Lighthouse currently uses the following ENR fields:
@@ -18,15 +17,14 @@ Lighthouse currently uses the following ENR fields:
 | `attnets` | An SSZ bitfield which indicates which of the 64 subnets the node is subscribed to for an extended period of time |
 | `syncnets` | An SSZ bitfield which indicates which of the sync committee subnets the node is subscribed to |
 
-
 ### Lighthouse Custom Fields
 
 Lighthouse is currently using the following custom ENR fields.
+
 | Field | Description |
 | ---- | ---- |
 | `quic` | The UDP port on which the QUIC transport is listening on IPv4 |
 | `quic6` | The UDP port on which the QUIC transport is listening on IPv6 |
-
 
 ## Custom RPC Messages
 
@@ -43,9 +41,9 @@ custom RPC error messages.
 | 251 | Banned | The peer has been banned and disconnected |
 | 252 | Banned IP | The IP the node is connected to us with has been banned |
 
-
 ### Error Codes
 
 | Code | Message | Description |
 | ---- | ---- | ---- |
 | 139 | Rate Limited | The peer has been rate limited so we return this error as a response |
+| 140 | Blobs Not Found For Block | We do not possess the blobs for the requested block |

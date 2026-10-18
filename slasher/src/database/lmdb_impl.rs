@@ -3,15 +3,12 @@
 use crate::{
     config::MEGABYTE,
     database::{
-        interface::{Key, OpenDatabases, Value},
+        interface::{Key, Value},
         *,
     },
-    Config, Error,
 };
 use lmdb::{Cursor as _, DatabaseFlags, Transaction, WriteFlags};
 use lmdb_sys::{MDB_FIRST, MDB_GET_CURRENT, MDB_LAST, MDB_NEXT};
-use std::borrow::Cow;
-use std::marker::PhantomData;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -44,7 +41,7 @@ impl Environment {
         Ok(Environment { env })
     }
 
-    pub fn create_databases(&self) -> Result<OpenDatabases, Error> {
+    pub fn create_databases(&self) -> Result<OpenDatabases<'_>, Error> {
         let indexed_attestation_db = self
             .env
             .create_db(Some(INDEXED_ATTESTATION_DB), Self::db_flags())?;
@@ -83,7 +80,7 @@ impl Environment {
         })
     }
 
-    pub fn begin_rw_txn(&self) -> Result<RwTransaction, Error> {
+    pub fn begin_rw_txn(&self) -> Result<RwTransaction<'_>, Error> {
         let txn = self.env.begin_rw_txn()?;
         Ok(RwTransaction { txn })
     }
@@ -103,7 +100,7 @@ impl Environment {
 impl<'env> RwTransaction<'env> {
     pub fn get<K: AsRef<[u8]> + ?Sized>(
         &'env self,
-        db: &Database<'env>,
+        db: &'env Database,
         key: &K,
     ) -> Result<Option<Cow<'env, [u8]>>, Error> {
         Ok(self.txn.get(db.db, key).optional()?.map(Cow::Borrowed))
@@ -140,7 +137,7 @@ impl<'env> RwTransaction<'env> {
 }
 
 impl<'env> Cursor<'env> {
-    pub fn first_key(&mut self) -> Result<Option<Key>, Error> {
+    pub fn first_key(&mut self) -> Result<Option<Key<'_>>, Error> {
         let opt_key = self
             .cursor
             .get(None, None, MDB_FIRST)
@@ -168,8 +165,12 @@ impl<'env> Cursor<'env> {
     }
 
     pub fn get_current(&mut self) -> Result<Option<(Key<'env>, Value<'env>)>, Error> {
+        // FIXME: lmdb has an extremely broken API which can mutate the SHARED REFERENCE
+        // `value` after `get_current` is called. We need to convert it to a Vec here in order
+        // to avoid `value` changing after another cursor operation. I think this represents a bug
+        // in the LMDB bindings, as shared references should be immutable.
         if let Some((Some(key), value)) = self.cursor.get(None, None, MDB_GET_CURRENT).optional()? {
-            Ok(Some((Cow::Borrowed(key), Cow::Borrowed(value))))
+            Ok(Some((Cow::Borrowed(key), Cow::Owned(value.to_vec()))))
         } else {
             Ok(None)
         }
@@ -184,6 +185,29 @@ impl<'env> Cursor<'env> {
         self.cursor
             .put(&key, &value, RwTransaction::write_flags())?;
         Ok(())
+    }
+
+    pub fn delete_while(
+        &mut self,
+        f: impl Fn(&[u8]) -> Result<bool, Error>,
+    ) -> Result<Vec<Cow<'_, [u8]>>, Error> {
+        let mut result = vec![];
+
+        loop {
+            let (key_bytes, value) = self.get_current()?.ok_or(Error::MissingKey)?;
+
+            if f(&key_bytes)? {
+                result.push(value);
+                self.delete_current()?;
+                if self.next_key()?.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(result)
     }
 }
 

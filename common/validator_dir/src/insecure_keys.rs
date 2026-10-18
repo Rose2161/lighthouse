@@ -6,8 +6,8 @@
 
 use crate::{Builder, BuilderError};
 use eth2_keystore::{
+    DKLEN, Keystore, KeystoreBuilder, PlainText,
     json_keystore::{Kdf, Scrypt},
-    Keystore, KeystoreBuilder, PlainText, DKLEN,
 };
 use std::path::PathBuf;
 use types::test_utils::generate_deterministic_keypair;
@@ -15,7 +15,7 @@ use types::test_utils::generate_deterministic_keypair;
 /// A very weak password with which to encrypt the keystores.
 pub const INSECURE_PASSWORD: &[u8] = &[50; 51];
 
-impl<'a> Builder<'a> {
+impl Builder<'_> {
     /// Generate the voting keystore using a deterministic, well-known, **unsafe** keypair.
     ///
     /// **NEVER** use these keys in production!

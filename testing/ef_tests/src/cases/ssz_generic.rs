@@ -1,18 +1,21 @@
 #![allow(non_snake_case)]
 
 use super::*;
-use crate::cases::common::{SszStaticType, TestU128, TestU256};
+use crate::cases::common::{DecimalU128, DecimalU256, SszStaticType};
 use crate::cases::ssz_static::{check_serialization, check_tree_hash};
-use crate::decode::{snappy_decode_file, yaml_decode_file};
-use serde::{de::Error as SerdeError, Deserializer};
-use serde_derive::Deserialize;
+use crate::decode::{context_yaml_decode_file, log_file_access, snappy_decode_file};
+use context_deserialize::{ContextDeserialize, context_deserialize};
+use milhouse::Vector;
+use serde::{Deserialize, Deserializer, de::Error as SerdeError};
 use ssz_derive::{Decode, Encode};
-use std::path::{Path, PathBuf};
+use ssz_types::{BitList, BitVector, FixedVector, VariableList};
+use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
-use types::typenum::*;
-use types::{BitList, BitVector, FixedVector, ForkName, VariableList};
+use typenum::*;
+use types::ForkName;
 
 #[derive(Debug, Clone, Deserialize)]
+#[context_deserialize(ForkName)]
 struct Metadata {
     root: String,
     #[serde(rename(deserialize = "signing_root"))]
@@ -57,8 +60,8 @@ macro_rules! type_dispatch {
             "uint16" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* u16>, $($rest)*),
             "uint32" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* u32>, $($rest)*),
             "uint64" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* u64>, $($rest)*),
-            "uint128" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* TestU128>, $($rest)*),
-            "uint256" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* TestU256>, $($rest)*),
+            "uint128" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* DecimalU128>, $($rest)*),
+            "uint256" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* DecimalU256>, $($rest)*),
             _ => Err(Error::FailedToParseTest(format!("unsupported: {}", $value))),
         }
     };
@@ -79,12 +82,16 @@ macro_rules! type_dispatch {
             "7" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U7>, $($rest)*),
             "8" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U8>, $($rest)*),
             "9" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U9>, $($rest)*),
+            "15" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U15>, $($rest)*),
             "16" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U16>, $($rest)*),
+            "17" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U17>, $($rest)*),
             "31" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U31>, $($rest)*),
             "32" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U32>, $($rest)*),
+            "33" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U33>, $($rest)*),
             "64" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U64>, $($rest)*),
             "128" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U128>, $($rest)*),
             "256" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U256>, $($rest)*),
+            "511" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U511>, $($rest)*),
             "512" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U512>, $($rest)*),
             "513" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U513>, $($rest)*),
             "1024" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* U1024>, $($rest)*),
@@ -106,6 +113,8 @@ macro_rules! type_dispatch {
             "VarTestStruct" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* VarTestStruct>, $($rest)*),
             "ComplexTestStruct" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* ComplexTestStruct>, $($rest)*),
             "BitsStruct" => type_dispatch!($function, ($($arg),*), $base_ty, <$($param_ty,)* BitsStruct>, $($rest)*),
+            // EIP-7916 is still in draft and hasn't been implemented yet https://eips.ethereum.org/EIPS/eip-7916
+            "ProgressiveTestStruct" | "ProgressiveBitsStruct" => Err(Error::SkippedKnownFailure),
             _ => Err(Error::FailedToParseTest(format!("unsupported: {}", $value))),
         }
     };
@@ -119,7 +128,7 @@ macro_rules! type_dispatch {
 }
 
 impl Case for SszGeneric {
-    fn result(&self, _case_index: usize, _fork_name: ForkName) -> Result<(), Error> {
+    fn result(&self, _case_index: usize, fork_name: ForkName) -> Result<(), Error> {
         let parts = self.case_name.split('_').collect::<Vec<_>>();
 
         match self.handler_name.as_str() {
@@ -127,9 +136,23 @@ impl Case for SszGeneric {
                 let elem_ty = parts[1];
                 let length = parts[2];
 
+                // Skip length 0 tests. Milhouse doesn't have any checks against 0-capacity lists.
+                if length == "0" {
+                    log_file_access(self.path.join("serialized.ssz_snappy"));
+                    return Ok(());
+                }
+
                 type_dispatch!(
                     ssz_generic_test,
-                    (&self.path),
+                    (&self.path, fork_name),
+                    Vector,
+                    <>,
+                    [elem_ty => primitive_type]
+                    [length => typenum]
+                )?;
+                type_dispatch!(
+                    ssz_generic_test,
+                    (&self.path, fork_name),
                     FixedVector,
                     <>,
                     [elem_ty => primitive_type]
@@ -146,7 +169,7 @@ impl Case for SszGeneric {
 
                 type_dispatch!(
                     ssz_generic_test,
-                    (&self.path),
+                    (&self.path, fork_name),
                     BitList,
                     <>,
                     [limit => typenum]
@@ -157,21 +180,21 @@ impl Case for SszGeneric {
 
                 type_dispatch!(
                     ssz_generic_test,
-                    (&self.path),
+                    (&self.path, fork_name),
                     BitVector,
                     <>,
                     [length => typenum]
                 )?;
             }
             "boolean" => {
-                ssz_generic_test::<bool>(&self.path)?;
+                ssz_generic_test::<bool>(&self.path, fork_name)?;
             }
             "uints" => {
                 let type_name = "uint".to_owned() + parts[1];
 
                 type_dispatch!(
                     ssz_generic_test,
-                    (&self.path),
+                    (&self.path, fork_name),
                     _,
                     <>,
                     [type_name.as_str() => primitive_type]
@@ -182,7 +205,7 @@ impl Case for SszGeneric {
 
                 type_dispatch!(
                     ssz_generic_test,
-                    (&self.path),
+                    (&self.path, fork_name),
                     _,
                     <>,
                     [type_name => test_container]
@@ -194,10 +217,15 @@ impl Case for SszGeneric {
     }
 }
 
-fn ssz_generic_test<T: SszStaticType + ssz::Decode>(path: &Path) -> Result<(), Error> {
+fn ssz_generic_test<
+    T: SszStaticType + for<'de> ContextDeserialize<'de, ForkName> + TreeHash + ssz::Decode,
+>(
+    path: &Path,
+    fork_name: ForkName,
+) -> Result<(), Error> {
     let meta_path = path.join("meta.yaml");
     let meta: Option<Metadata> = if meta_path.is_file() {
-        Some(yaml_decode_file(&meta_path)?)
+        Some(context_yaml_decode_file(&meta_path, fork_name)?)
     } else {
         None
     };
@@ -207,7 +235,7 @@ fn ssz_generic_test<T: SszStaticType + ssz::Decode>(path: &Path) -> Result<(), E
 
     let value_path = path.join("value.yaml");
     let value: Option<T> = if value_path.is_file() {
-        Some(yaml_decode_file(&value_path)?)
+        Some(context_yaml_decode_file(&value_path, fork_name)?)
     } else {
         None
     };
@@ -218,7 +246,7 @@ fn ssz_generic_test<T: SszStaticType + ssz::Decode>(path: &Path) -> Result<(), E
         check_serialization(&value, &serialized, T::from_ssz_bytes)?;
 
         if let Some(ref meta) = meta {
-            check_tree_hash(&meta.root, value.tree_hash_root().as_bytes())?;
+            check_tree_hash(&meta.root, value.tree_hash_root().as_slice())?;
         }
     }
     // Invalid
@@ -233,17 +261,20 @@ fn ssz_generic_test<T: SszStaticType + ssz::Decode>(path: &Path) -> Result<(), E
 
 // Containers for SSZ generic tests
 #[derive(Debug, Clone, Default, PartialEq, Decode, Encode, TreeHash, Deserialize)]
+#[context_deserialize(ForkName)]
 struct SingleFieldTestStruct {
     A: u8,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Decode, Encode, TreeHash, Deserialize)]
+#[context_deserialize(ForkName)]
 struct SmallTestStruct {
     A: u16,
     B: u16,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Decode, Encode, TreeHash, Deserialize)]
+#[context_deserialize(ForkName)]
 struct FixedTestStruct {
     A: u8,
     B: u64,
@@ -251,6 +282,7 @@ struct FixedTestStruct {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Decode, Encode, TreeHash, Deserialize)]
+#[context_deserialize(ForkName)]
 struct VarTestStruct {
     A: u16,
     B: VariableList<u16, U1024>,
@@ -258,6 +290,7 @@ struct VarTestStruct {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Decode, Encode, TreeHash, Deserialize)]
+#[context_deserialize(ForkName)]
 struct ComplexTestStruct {
     A: u16,
     B: VariableList<u16, U128>,
@@ -265,11 +298,12 @@ struct ComplexTestStruct {
     #[serde(deserialize_with = "byte_list_from_hex_str")]
     D: VariableList<u8, U256>,
     E: VarTestStruct,
-    F: FixedVector<FixedTestStruct, U4>,
-    G: FixedVector<VarTestStruct, U2>,
+    F: Vector<FixedTestStruct, U4>,
+    G: Vector<VarTestStruct, U2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Decode, Encode, TreeHash, Deserialize)]
+#[context_deserialize(ForkName)]
 struct BitsStruct {
     A: BitList<U5>,
     B: BitVector<U2>,
@@ -286,14 +320,13 @@ where
 {
     let s: String = serde::de::Deserialize::deserialize(deserializer)?;
     let decoded: Vec<u8> = hex::decode(&s.as_str()[2..]).map_err(D::Error::custom)?;
+    let decoded_len = decoded.len();
 
-    if decoded.len() > N::to_usize() {
-        Err(D::Error::custom(format!(
+    decoded.try_into().map_err(|_| {
+        D::Error::custom(format!(
             "Too many values for list, got: {}, limit: {}",
-            decoded.len(),
+            decoded_len,
             N::to_usize()
-        )))
-    } else {
-        Ok(decoded.into())
-    }
+        ))
+    })
 }

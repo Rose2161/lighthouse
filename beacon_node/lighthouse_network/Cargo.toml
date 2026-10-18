@@ -3,63 +3,61 @@ name = "lighthouse_network"
 version = "0.2.0"
 authors = ["Sigma Prime <contact@sigmaprime.io>"]
 edition = { workspace = true }
+autotests = false
 
 [dependencies]
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+bls = { workspace = true }
+bytes = { workspace = true }
+delay_map = { workspace = true }
+directory = { workspace = true }
+dirs = { workspace = true }
 discv5 = { workspace = true }
-unsigned-varint = { version = "0.6", features = ["codec"] }
-ssz_types = { workspace = true }
-types = { workspace = true }
-serde = { workspace = true }
-serde_derive = "1"
+either = { workspace = true }
+eth2 = { workspace = true, features = ["lighthouse"] }
 ethereum_ssz = { workspace = true }
 ethereum_ssz_derive = { workspace = true }
-tree_hash = { workspace = true }
-tree_hash_derive = { workspace = true }
-slog = { workspace = true }
-lighthouse_version = { workspace = true }
-tokio = { workspace = true }
-futures = { workspace = true }
-error-chain = { workspace = true }
-dirs = { workspace = true }
+fixed_bytes = { workspace = true }
 fnv = { workspace = true }
-lazy_static = { workspace = true }
-lighthouse_metrics = { workspace = true }
-smallvec = { workspace = true }
-tokio-io-timeout = "1"
-lru = { workspace = true }
-lru_cache = { workspace = true }
-parking_lot = { workspace = true }
-sha2 = { workspace = true }
-snap = { workspace = true }
+futures = { workspace = true }
+hashlink = { workspace = true }
 hex = { workspace = true }
-tokio-util = { workspace = true }
-tiny-keccak = "2"
-task_executor = { workspace = true }
+if-addrs = "0.14"
+itertools = { workspace = true }
+libp2p = { workspace = true }
+libp2p-mplex = { git = "https://github.com/libp2p/rust-libp2p.git" }
+lighthouse_version = { workspace = true }
+logging = { workspace = true }
+lru_cache = { workspace = true }
+metrics = { workspace = true }
+network_utils = { workspace = true }
+parking_lot = { workspace = true }
+prometheus-client = "0.24.0"
 rand = { workspace = true }
-directory = { workspace = true }
 regex = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+smallvec = { workspace = true }
+snap = { workspace = true }
+ssz_types = { workspace = true }
 strum = { workspace = true }
 superstruct = { workspace = true }
-prometheus-client = "0.21.0"
-unused_port = { workspace = true }
-delay_map = { workspace = true }
-void = "1"
-libp2p-quic= { version = "0.9.2", features=["tokio"]}
-libp2p-mplex = "0.40.0"
-
-[dependencies.libp2p]
-version = "0.52"
-default-features = false
-features = ["identify", "yamux", "noise", "gossipsub", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa"]
+task_executor = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+typenum = { workspace = true }
+types = { workspace = true }
+unsigned-varint = { version = "0.8", features = ["codec"] }
 
 [dev-dependencies]
-slog-term = { workspace = true }
-slog-async = { workspace = true }
+async-channel = { workspace = true }
+logging = { workspace = true }
+proptest = { workspace = true }
 tempfile = { workspace = true }
-exit-future = { workspace = true }
-quickcheck = { workspace = true }
-quickcheck_macros = { workspace = true }
 
-[features]
-libp2p-websocket = []
-
+[[test]]
+name = "lighthouse_network_tests"
+path = "tests/main.rs"

@@ -1,11 +1,11 @@
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::types::GossipKind;
 use crate::GossipTopic;
+use crate::types::GossipKind;
 
 use tokio_util::time::delay_queue::{DelayQueue, Key};
 
@@ -20,6 +20,8 @@ pub struct GossipCache {
     topic_msgs: HashMap<GossipTopic, HashMap<Vec<u8>, Key>>,
     /// Timeout for blocks.
     beacon_block: Option<Duration>,
+    /// Timeout for data columns.
+    data_column_sidecar: Option<Duration>,
     /// Timeout for aggregate attestations.
     aggregates: Option<Duration>,
     /// Timeout for attestations.
@@ -36,6 +38,14 @@ pub struct GossipCache {
     sync_committee_message: Option<Duration>,
     /// Timeout for signed BLS to execution changes.
     bls_to_execution_change: Option<Duration>,
+    /// Timeout for signed execution payload envelope.
+    execution_payload: Option<Duration>,
+    /// Timeout for execution payload bid.
+    execution_payload_bid: Option<Duration>,
+    /// Timeout for payload attestation message.
+    payload_attestation: Option<Duration>,
+    /// Timeout for proposer preferences.
+    proposer_preferences: Option<Duration>,
     /// Timeout for light client finality updates.
     light_client_finality_update: Option<Duration>,
     /// Timeout for light client optimistic updates.
@@ -47,6 +57,8 @@ pub struct GossipCacheBuilder {
     default_timeout: Option<Duration>,
     /// Timeout for blocks.
     beacon_block: Option<Duration>,
+    /// Timeout for data column sidecars.
+    data_column_sidecar: Option<Duration>,
     /// Timeout for aggregate attestations.
     aggregates: Option<Duration>,
     /// Timeout for attestations.
@@ -63,6 +75,14 @@ pub struct GossipCacheBuilder {
     sync_committee_message: Option<Duration>,
     /// Timeout for signed BLS to execution changes.
     bls_to_execution_change: Option<Duration>,
+    /// Timeout for signed execution payload envelope.
+    execution_payload: Option<Duration>,
+    /// Timeout for execution payload bid.
+    execution_payload_bid: Option<Duration>,
+    /// Timeout for payload attestation message.
+    payload_attestation: Option<Duration>,
+    /// Timeout for proposer preferences.
+    proposer_preferences: Option<Duration>,
     /// Timeout for light client finality updates.
     light_client_finality_update: Option<Duration>,
     /// Timeout for light client optimistic updates.
@@ -131,6 +151,30 @@ impl GossipCacheBuilder {
         self
     }
 
+    /// Timeout for signed execution payload envelope.
+    pub fn execution_payload_timeout(mut self, timeout: Duration) -> Self {
+        self.execution_payload = Some(timeout);
+        self
+    }
+
+    /// Timeout for execution payload bid.
+    pub fn execution_payload_bid_timeout(mut self, timeout: Duration) -> Self {
+        self.execution_payload_bid = Some(timeout);
+        self
+    }
+
+    /// Timeout for payload attestation message.
+    pub fn payload_attestation_timeout(mut self, timeout: Duration) -> Self {
+        self.payload_attestation = Some(timeout);
+        self
+    }
+
+    /// Timeout for proposer preferences.
+    pub fn proposer_preferences_timeout(mut self, timeout: Duration) -> Self {
+        self.proposer_preferences = Some(timeout);
+        self
+    }
+
     /// Timeout for light client finality update messages.
     pub fn light_client_finality_update_timeout(mut self, timeout: Duration) -> Self {
         self.light_client_finality_update = Some(timeout);
@@ -147,6 +191,7 @@ impl GossipCacheBuilder {
         let GossipCacheBuilder {
             default_timeout,
             beacon_block,
+            data_column_sidecar,
             aggregates,
             attestation,
             voluntary_exit,
@@ -155,6 +200,10 @@ impl GossipCacheBuilder {
             signed_contribution_and_proof,
             sync_committee_message,
             bls_to_execution_change,
+            execution_payload,
+            execution_payload_bid,
+            payload_attestation,
+            proposer_preferences,
             light_client_finality_update,
             light_client_optimistic_update,
         } = self;
@@ -162,6 +211,7 @@ impl GossipCacheBuilder {
             expirations: DelayQueue::default(),
             topic_msgs: HashMap::default(),
             beacon_block: beacon_block.or(default_timeout),
+            data_column_sidecar: data_column_sidecar.or(default_timeout),
             aggregates: aggregates.or(default_timeout),
             attestation: attestation.or(default_timeout),
             voluntary_exit: voluntary_exit.or(default_timeout),
@@ -170,6 +220,10 @@ impl GossipCacheBuilder {
             signed_contribution_and_proof: signed_contribution_and_proof.or(default_timeout),
             sync_committee_message: sync_committee_message.or(default_timeout),
             bls_to_execution_change: bls_to_execution_change.or(default_timeout),
+            execution_payload: execution_payload.or(default_timeout),
+            execution_payload_bid: execution_payload_bid.or(default_timeout),
+            payload_attestation: payload_attestation.or(default_timeout),
+            proposer_preferences: proposer_preferences.or(default_timeout),
             light_client_finality_update: light_client_finality_update.or(default_timeout),
             light_client_optimistic_update: light_client_optimistic_update.or(default_timeout),
         }
@@ -187,6 +241,7 @@ impl GossipCache {
     pub fn insert(&mut self, topic: GossipTopic, data: Vec<u8>) {
         let expire_timeout = match topic.kind() {
             GossipKind::BeaconBlock => self.beacon_block,
+            GossipKind::DataColumnSidecar(_) => self.data_column_sidecar,
             GossipKind::BeaconAggregateAndProof => self.aggregates,
             GossipKind::Attestation(_) => self.attestation,
             GossipKind::VoluntaryExit => self.voluntary_exit,
@@ -195,12 +250,15 @@ impl GossipCache {
             GossipKind::SignedContributionAndProof => self.signed_contribution_and_proof,
             GossipKind::SyncCommitteeMessage(_) => self.sync_committee_message,
             GossipKind::BlsToExecutionChange => self.bls_to_execution_change,
+            GossipKind::ExecutionPayload => self.execution_payload,
+            GossipKind::ExecutionPayloadBid => self.execution_payload_bid,
+            GossipKind::PayloadAttestation => self.payload_attestation,
+            GossipKind::ProposerPreferences => self.proposer_preferences,
             GossipKind::LightClientFinalityUpdate => self.light_client_finality_update,
             GossipKind::LightClientOptimisticUpdate => self.light_client_optimistic_update,
         };
-        let expire_timeout = match expire_timeout {
-            Some(expire_timeout) => expire_timeout,
-            None => return,
+        let Some(expire_timeout) = expire_timeout else {
+            return;
         };
         match self
             .topic_msgs
@@ -219,7 +277,7 @@ impl GossipCache {
     // Get the registered messages for this topic.
     pub fn retrieve(&mut self, topic: &GossipTopic) -> Option<impl Iterator<Item = Vec<u8>> + '_> {
         if let Some(msgs) = self.topic_msgs.remove(topic) {
-            for (_, key) in msgs.iter() {
+            for key in msgs.values() {
                 self.expirations.remove(key);
             }
             Some(msgs.into_keys())
@@ -234,26 +292,24 @@ impl futures::stream::Stream for GossipCache {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.expirations.poll_expired(cx) {
-            Poll::Ready(Some(Ok(expired))) => {
+            Poll::Ready(Some(expired)) => {
                 let expected_key = expired.key();
                 let (topic, data) = expired.into_inner();
-                match self.topic_msgs.get_mut(&topic) {
-                    Some(msgs) => {
-                        let key = msgs.remove(&data);
-                        debug_assert_eq!(key, Some(expected_key));
-                        if msgs.is_empty() {
-                            // no more messages for this topic.
-                            self.topic_msgs.remove(&topic);
-                        }
-                    }
-                    None => {
-                        #[cfg(debug_assertions)]
-                        panic!("Topic for registered message is not present.")
+                let topic_msg = self.topic_msgs.get_mut(&topic);
+                debug_assert!(
+                    topic_msg.is_some(),
+                    "Topic for registered message is not present."
+                );
+                if let Some(msgs) = topic_msg {
+                    let key = msgs.remove(&data);
+                    debug_assert_eq!(key, Some(expected_key));
+                    if msgs.is_empty() {
+                        // no more messages for this topic.
+                        self.topic_msgs.remove(&topic);
                     }
                 }
                 Poll::Ready(Some(Ok(topic)))
             }
-            Poll::Ready(Some(Err(x))) => Poll::Ready(Some(Err(x.to_string()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
@@ -262,8 +318,6 @@ impl futures::stream::Stream for GossipCache {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::GossipKind;
-
     use super::*;
     use futures::stream::StreamExt;
 

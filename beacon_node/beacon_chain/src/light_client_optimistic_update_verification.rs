@@ -1,12 +1,10 @@
-use crate::{BeaconChain, BeaconChainError, BeaconChainTypes};
-use derivative::Derivative;
+use crate::{BeaconChain, BeaconChainTypes};
+use educe::Educe;
 use eth2::types::Hash256;
 use slot_clock::SlotClock;
 use std::time::Duration;
 use strum::AsRefStr;
-use types::{
-    light_client_update::Error as LightClientUpdateError, LightClientOptimisticUpdate, Slot,
-};
+use types::{LightClientOptimisticUpdate, Slot};
 
 /// Returned when a light client optimistic update was not successfully verified. It might not have been verified for
 /// two reasons:
@@ -17,8 +15,6 @@ use types::{
 ///   (the `BeaconChainError` variant)
 #[derive(Debug, AsRefStr)]
 pub enum Error {
-    /// Light client optimistic update message with a lower or equal optimistic_header slot already forwarded.
-    OptimisticUpdateAlreadySeen,
     /// The light client optimistic message was received is prior to one-third of slot duration passage. (with
     /// respect to the gossip clock disparity and slot clock duration).
     ///
@@ -26,37 +22,35 @@ pub enum Error {
     ///
     /// Assuming the local clock is correct, the peer has sent an invalid message.
     TooEarly,
-    /// Light client optimistic update message does not match the locally constructed one.
-    ///
-    /// ## Peer Scoring
-    ///
-    InvalidLightClientOptimisticUpdate,
+    /// Light client optimistic update message does not match the locally constructed one, it has a
+    /// different signature slot.
+    MismatchedSignatureSlot { local: Slot, observed: Slot },
+    /// Light client optimistic update message does not match the locally constructed one, it has a
+    /// different block header at the same slot.
+    MismatchedAttestedHeader {
+        local_attested_header_root: Hash256,
+        observed_attested_header_root: Hash256,
+        signature_slot: Slot,
+    },
+    /// Light client optimistic update message does not match the locally constructed one, it has a
+    /// different sync aggregate for the same slot and attested header.
+    MismatchedSyncAggregate {
+        attested_header_root: Hash256,
+        signature_slot: Slot,
+    },
     /// Signature slot start time is none.
     SigSlotStartIsNone,
     /// Failed to construct a LightClientOptimisticUpdate from state.
     FailedConstructingUpdate,
     /// Unknown block with parent root.
     UnknownBlockParentRoot(Hash256),
-    /// Beacon chain error occured.
-    BeaconChainError(BeaconChainError),
-    LightClientUpdateError(LightClientUpdateError),
-}
-
-impl From<BeaconChainError> for Error {
-    fn from(e: BeaconChainError) -> Self {
-        Error::BeaconChainError(e)
-    }
-}
-
-impl From<LightClientUpdateError> for Error {
-    fn from(e: LightClientUpdateError) -> Self {
-        Error::LightClientUpdateError(e)
-    }
+    /// Silently ignore this light client optimistic update
+    Ignore,
 }
 
 /// Wraps a `LightClientOptimisticUpdate` that has been verified for propagation on the gossip network.
-#[derive(Derivative)]
-#[derivative(Clone(bound = "T: BeaconChainTypes"))]
+#[derive(Educe)]
+#[educe(Clone(bound(T: BeaconChainTypes)))]
 pub struct VerifiedLightClientOptimisticUpdate<T: BeaconChainTypes> {
     light_client_optimistic_update: LightClientOptimisticUpdate<T::EthSpec>,
     pub parent_root: Hash256,
@@ -67,72 +61,98 @@ impl<T: BeaconChainTypes> VerifiedLightClientOptimisticUpdate<T> {
     /// Returns `Ok(Self)` if the `light_client_optimistic_update` is valid to be (re)published on the gossip
     /// network.
     pub fn verify(
-        light_client_optimistic_update: LightClientOptimisticUpdate<T::EthSpec>,
+        rcv_optimistic_update: LightClientOptimisticUpdate<T::EthSpec>,
         chain: &BeaconChain<T>,
         seen_timestamp: Duration,
     ) -> Result<Self, Error> {
-        let gossiped_optimistic_slot = light_client_optimistic_update.attested_header.slot;
-        let one_third_slot_duration = Duration::new(chain.spec.seconds_per_slot / 3, 0);
-        let signature_slot = light_client_optimistic_update.signature_slot;
-        let start_time = chain.slot_clock.start_of(signature_slot);
-        let mut latest_seen_optimistic_update = chain.latest_seen_optimistic_update.lock();
+        // verify that enough time has passed for the block to have been propagated
+        let start_time = chain
+            .slot_clock
+            .start_of(rcv_optimistic_update.signature_slot())
+            .ok_or(Error::SigSlotStartIsNone)?;
+
+        let sync_message_due = chain.spec.get_sync_message_due();
+
+        if seen_timestamp + chain.spec.maximum_gossip_clock_disparity()
+            < start_time + sync_message_due
+        {
+            return Err(Error::TooEarly);
+        }
+
+        if let Some(latest_broadcasted_optimistic_update) = chain
+            .light_client_server_cache
+            .get_latest_broadcasted_optimistic_update()
+        {
+            // Ignore the incoming optimistic update if we've already broadcasted it
+            if latest_broadcasted_optimistic_update == rcv_optimistic_update {
+                return Err(Error::Ignore);
+            }
+
+            // Ignore the incoming optimistic update if the latest broadcasted slot
+            // is greater than the incoming slot.
+            if latest_broadcasted_optimistic_update.get_slot() > rcv_optimistic_update.get_slot() {
+                return Err(Error::Ignore);
+            }
+        }
 
         let head = chain.canonical_head.cached_head();
         let head_block = &head.snapshot.beacon_block;
-        let attested_block_root = head_block.message().parent_root();
-        let attested_block = chain
-            .get_blinded_block(&attested_block_root)?
-            .ok_or(Error::FailedConstructingUpdate)?;
-
-        let attested_state = chain
-            .get_state(&attested_block.state_root(), Some(attested_block.slot()))?
-            .ok_or(Error::FailedConstructingUpdate)?;
-        let latest_seen_optimistic_update_slot = match latest_seen_optimistic_update.as_ref() {
-            Some(update) => update.attested_header.slot,
-            None => Slot::new(0),
-        };
-
-        // verify that no other optimistic_update with a lower or equal
-        // optimistic_header.slot was already forwarded on the network
-        if gossiped_optimistic_slot <= latest_seen_optimistic_update_slot {
-            return Err(Error::OptimisticUpdateAlreadySeen);
-        }
-
-        // verify that enough time has passed for the block to have been propagated
-        match start_time {
-            Some(time) => {
-                if seen_timestamp + chain.spec.maximum_gossip_clock_disparity()
-                    < time + one_third_slot_duration
-                {
-                    return Err(Error::TooEarly);
-                }
-            }
-            None => return Err(Error::SigSlotStartIsNone),
-        }
-
         // check if we can process the optimistic update immediately
         // otherwise queue
-        let canonical_root = light_client_optimistic_update
-            .attested_header
-            .canonical_root();
+        let canonical_root = rcv_optimistic_update.get_canonical_root();
 
         if canonical_root != head_block.message().parent_root() {
             return Err(Error::UnknownBlockParentRoot(canonical_root));
         }
 
-        let optimistic_update =
-            LightClientOptimisticUpdate::new(&chain.spec, head_block, &attested_state)?;
+        let latest_optimistic_update = chain
+            .light_client_server_cache
+            .get_latest_optimistic_update()
+            .ok_or(Error::FailedConstructingUpdate)?;
 
-        // verify that the gossiped optimistic update is the same as the locally constructed one.
-        if optimistic_update != light_client_optimistic_update {
-            return Err(Error::InvalidLightClientOptimisticUpdate);
+        // Ignore the incoming optimistic update if the latest constructed slot
+        // is greater than the incoming slot.
+        if latest_optimistic_update.get_slot() > rcv_optimistic_update.get_slot() {
+            return Err(Error::Ignore);
         }
 
-        *latest_seen_optimistic_update = Some(light_client_optimistic_update.clone());
+        // Verify that the gossiped optimistic update is the same as the locally constructed one.
+        if latest_optimistic_update != rcv_optimistic_update {
+            let signature_slot = latest_optimistic_update.signature_slot();
+            if signature_slot != rcv_optimistic_update.signature_slot() {
+                // The locally constructed optimistic update is not up to date, probably
+                // because the node has fallen behind and needs to sync.
+                if rcv_optimistic_update.signature_slot() > signature_slot {
+                    return Err(Error::Ignore);
+                }
+                return Err(Error::MismatchedSignatureSlot {
+                    local: signature_slot,
+                    observed: rcv_optimistic_update.signature_slot(),
+                });
+            }
+            let local_attested_header_root = latest_optimistic_update.get_canonical_root();
+            let observed_attested_header_root = rcv_optimistic_update.get_canonical_root();
+            if local_attested_header_root != observed_attested_header_root {
+                return Err(Error::MismatchedAttestedHeader {
+                    local_attested_header_root,
+                    observed_attested_header_root,
+                    signature_slot,
+                });
+            }
+            return Err(Error::MismatchedSyncAggregate {
+                attested_header_root: local_attested_header_root,
+                signature_slot,
+            });
+        }
 
+        chain
+            .light_client_server_cache
+            .set_latest_broadcasted_optimistic_update(rcv_optimistic_update.clone());
+
+        let parent_root = rcv_optimistic_update.get_parent_root();
         Ok(Self {
-            light_client_optimistic_update,
-            parent_root: canonical_root,
+            light_client_optimistic_update: rcv_optimistic_update,
+            parent_root,
             seen_timestamp,
         })
     }
