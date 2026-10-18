@@ -1,10 +1,10 @@
 use super::*;
-use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType};
+use beacon_chain::test_utils::test_spec;
 use state_processing::{
-    per_block_processing, per_block_processing::errors::ExitInvalid, BlockProcessingError,
-    BlockSignatureStrategy, ConsensusContext, VerifyBlockRoot,
+    BlockProcessingError, BlockSignatureStrategy, ConsensusContext, VerifyBlockRoot,
+    per_block_processing, per_block_processing::errors::ExitInvalid,
 };
-use types::{BeaconBlock, BeaconState, Epoch, EthSpec, SignedBeaconBlock};
+use types::{BeaconBlock, Epoch};
 
 // Default validator index to exit.
 pub const VALIDATOR_INDEX: u64 = 0;
@@ -57,7 +57,7 @@ impl ExitTest {
                 block_modifier(&harness, block);
             })
             .await;
-        (signed_block, state)
+        ((*signed_block.0).clone(), state)
     }
 
     fn process(
@@ -71,13 +71,13 @@ impl ExitTest {
             BlockSignatureStrategy::VerifyIndividual,
             VerifyBlockRoot::True,
             &mut ctxt,
-            &E::default_spec(),
+            &test_spec::<E>(),
         )
     }
 
     #[cfg(all(test, not(debug_assertions)))]
     async fn run(self) -> BeaconState<E> {
-        let spec = &E::default_spec();
+        let spec = &test_spec::<E>();
         let expected = self.expected.clone();
         assert_eq!(STATE_EPOCH, spec.shard_committee_period);
 
@@ -126,7 +126,7 @@ vectors_and_tests!(
     ExitTest {
         block_modifier: Box::new(|_, block| {
             // Duplicate the exit
-            let exit = block.body().voluntary_exits().get(0).unwrap().clone();
+            let exit = block.body().voluntary_exits().first().unwrap().clone();
             block.body_mut().voluntary_exits_mut().push(exit).unwrap();
         }),
         expected: Err(BlockProcessingError::ExitInvalid {
@@ -332,7 +332,7 @@ mod custom_tests {
     fn assert_exited(state: &BeaconState<E>, validator_index: usize) {
         let spec = E::default_spec();
 
-        let validator = &state.validators()[validator_index];
+        let validator = &state.validators().get(validator_index).unwrap();
         assert_eq!(
             validator.exit_epoch,
             // This is correct until we exceed the churn limit. If that happens, we

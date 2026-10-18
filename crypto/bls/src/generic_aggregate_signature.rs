@@ -1,12 +1,12 @@
 use crate::{
+    Error, Hash256, INFINITY_SIGNATURE, SIGNATURE_BYTES_LEN,
     generic_aggregate_public_key::TAggregatePublicKey,
     generic_public_key::{GenericPublicKey, TPublicKey},
     generic_signature::{GenericSignature, TSignature},
-    Error, Hash256, INFINITY_SIGNATURE, SIGNATURE_BYTES_LEN,
 };
-use eth2_serde_utils::hex::encode as hex_encode;
 use serde::de::{Deserialize, Deserializer};
 use serde::ser::{Serialize, Serializer};
+use serde_utils::hex::encode as hex_encode;
 use ssz::{Decode, Encode};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -124,13 +124,15 @@ where
     /// Aggregates a signature onto `self`.
     pub fn add_assign(&mut self, other: &GenericSignature<Pub, Sig>) {
         if let Some(other_point) = other.point() {
-            self.is_infinity = self.is_infinity && other.is_infinity;
             if let Some(self_point) = &mut self.point {
-                self_point.add_assign(other_point)
+                self_point.add_assign(other_point);
+                self.is_infinity = self.is_infinity && other.is_infinity;
             } else {
                 let mut self_point = AggSig::infinity();
                 self_point.add_assign(other_point);
-                self.point = Some(self_point)
+                self.point = Some(self_point);
+                // the result is infinity, if `other` is
+                self.is_infinity = other.is_infinity;
             }
         }
     }
@@ -138,13 +140,15 @@ where
     /// Aggregates an aggregate signature onto `self`.
     pub fn add_assign_aggregate(&mut self, other: &Self) {
         if let Some(other_point) = other.point() {
-            self.is_infinity = self.is_infinity && other.is_infinity;
             if let Some(self_point) = &mut self.point {
-                self_point.add_assign_aggregate(other_point)
+                self_point.add_assign_aggregate(other_point);
+                self.is_infinity = self.is_infinity && other.is_infinity;
             } else {
                 let mut self_point = AggSig::infinity();
                 self_point.add_assign_aggregate(other_point);
-                self.point = Some(self_point)
+                self.point = Some(self_point);
+                // the result is infinity, if `other` is
+                self.is_infinity = other.is_infinity;
             }
         }
     }
@@ -266,7 +270,7 @@ where
 }
 
 /// Hashes the `self.serialize()` bytes.
-#[allow(clippy::derive_hash_xor_eq)]
+#[allow(clippy::derived_hash_with_manual_eq)]
 impl<Pub, AggPub, Sig, AggSig> Hash for GenericAggregateSignature<Pub, AggPub, Sig, AggSig>
 where
     Sig: TSignature<Pub>,

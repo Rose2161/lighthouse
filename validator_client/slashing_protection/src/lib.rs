@@ -1,7 +1,6 @@
 mod attestation_tests;
 mod block_tests;
 mod extra_interchange_tests;
-pub mod interchange;
 pub mod interchange_test;
 mod parallel_tests;
 mod registration_tests;
@@ -10,16 +9,21 @@ mod signed_block;
 mod slashing_database;
 pub mod test_utils;
 
+pub mod interchange {
+    pub use eip_3076::{Interchange, InterchangeMetadata};
+}
+
 pub use crate::signed_attestation::{InvalidAttestation, SignedAttestation};
 pub use crate::signed_block::{InvalidBlock, SignedBlock};
 pub use crate::slashing_database::{
-    InterchangeError, InterchangeImportOutcome, SlashingDatabase,
-    SUPPORTED_INTERCHANGE_FORMAT_VERSION,
+    CheckSlashability, InterchangeError, InterchangeImportOutcome,
+    SUPPORTED_INTERCHANGE_FORMAT_VERSION, SlashingDatabase,
 };
+use bls::PublicKeyBytes;
 use rusqlite::Error as SQLError;
+use std::fmt::Display;
 use std::io::{Error as IOError, ErrorKind};
-use std::string::ToString;
-use types::{Hash256, PublicKeyBytes};
+use types::Hash256;
 
 /// The filename within the `validators` directory that contains the slashing protection DB.
 pub const SLASHING_PROTECTION_FILENAME: &str = "slashing_protection.sqlite";
@@ -27,7 +31,7 @@ pub const SLASHING_PROTECTION_FILENAME: &str = "slashing_protection.sqlite";
 /// The attestation or block is not safe to sign.
 ///
 /// This could be because it's slashable, or because an error occurred.
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum NotSafe {
     UnregisteredValidator(PublicKeyBytes),
     DisabledValidator(PublicKeyBytes),
@@ -67,9 +71,9 @@ impl From<Hash256> for SigningRoot {
     }
 }
 
-impl Into<Hash256> for SigningRoot {
-    fn into(self) -> Hash256 {
-        self.0
+impl From<SigningRoot> for Hash256 {
+    fn from(from: SigningRoot) -> Hash256 {
+        from.0
     }
 }
 
@@ -83,13 +87,13 @@ impl SigningRoot {
     }
 
     fn to_hash256(self) -> Option<Hash256> {
-        Some(self.0).filter(|_| !self.is_null())
+        (!self.is_null()).then_some(self.0)
     }
 }
 
 /// Safely parse a `SigningRoot` from the given `column` of an SQLite `row`.
 fn signing_root_from_row(column: usize, row: &rusqlite::Row) -> rusqlite::Result<SigningRoot> {
-    use rusqlite::{types::Type, Error};
+    use rusqlite::{Error, types::Type};
 
     let bytes: Vec<u8> = row.get(column)?;
     if bytes.len() == 32 {
@@ -122,14 +126,16 @@ impl From<r2d2::Error> for NotSafe {
     }
 }
 
-impl ToString for NotSafe {
-    fn to_string(&self) -> String {
-        format!("{:?}", self)
+impl Display for NotSafe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
     }
 }
 
 #[cfg(test)]
 mod test {
+    use fixed_bytes::FixedBytesExtended;
+
     use super::*;
 
     #[test]

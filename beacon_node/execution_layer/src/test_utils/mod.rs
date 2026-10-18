@@ -2,96 +2,155 @@
 
 use crate::engine_api::auth::JwtKey;
 use crate::engine_api::{
-    auth::Auth, http::JSONRPC_VERSION, ExecutionBlock, PayloadStatusV1, PayloadStatusV1Status,
+    ExecutionBlock, PayloadStatusV1, PayloadStatusV1Status, auth::Auth, http::JSONRPC_VERSION,
 };
+use crate::json_structures::JsonClientVersionV1;
 use bytes::Bytes;
-use environment::null_logger;
 use execution_block_generator::PoWBlock;
 use handle_rpc::handle_rpc;
+use kzg::Kzg;
+
+use logging::create_test_tracing_subscriber;
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use slog::{info, Logger};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::{runtime, sync::oneshot};
+use tracing::info;
 use types::{EthSpec, ExecutionBlockHash, Uint256};
-use warp::{http::StatusCode, Filter, Rejection};
+use warp::{Filter, Rejection, http::StatusCode};
 
-pub use execution_block_generator::{generate_pow_block, Block, ExecutionBlockGenerator};
-pub use mock_builder::{Context as MockBuilderContext, MockBuilder, Operation, TestingBuilder};
+use crate::EngineCapabilities;
+pub use execution_block_generator::DEFAULT_GAS_LIMIT;
+pub use execution_block_generator::{
+    Block, ExecutionBlockGenerator, generate_blobs, generate_genesis_block,
+    generate_genesis_header, generate_pow_block, mock_el_extra_data, static_valid_tx,
+};
+pub use hook::Hook;
+pub use mock_builder::{MockBuilder, Operation, mock_builder_extra_data};
 pub use mock_execution_layer::MockExecutionLayer;
 
-pub const DEFAULT_TERMINAL_DIFFICULTY: u64 = 6400;
-pub const DEFAULT_TERMINAL_BLOCK: u64 = 64;
 pub const DEFAULT_JWT_SECRET: [u8; 32] = [42; 32];
-pub const DEFAULT_BUILDER_THRESHOLD_WEI: u128 = 1_000_000_000_000_000_000;
+pub const DEFAULT_MOCK_EL_PAYLOAD_VALUE_WEI: u128 = 10_000_000_000_000_000;
+pub const DEFAULT_BUILDER_PAYLOAD_VALUE_WEI: u128 = 20_000_000_000_000_000;
+pub const DEFAULT_ENGINE_CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    new_payload_v1: true,
+    new_payload_v2: true,
+    new_payload_v3: true,
+    new_payload_v4: true,
+    new_payload_v5: true,
+    forkchoice_updated_v1: true,
+    forkchoice_updated_v2: true,
+    forkchoice_updated_v3: true,
+    forkchoice_updated_v4: true,
+    get_payload_bodies_by_hash_v1: true,
+    get_payload_bodies_by_range_v1: true,
+    get_payload_v1: true,
+    get_payload_v2: true,
+    get_payload_v3: true,
+    get_payload_v4: true,
+    get_payload_v5: true,
+    get_payload_v6: true,
+    get_client_version_v1: true,
+    get_blobs_v2: true,
+    get_blobs_v3: true,
+};
+
+pub static DEFAULT_CLIENT_VERSION: LazyLock<JsonClientVersionV1> =
+    LazyLock::new(|| JsonClientVersionV1 {
+        code: "MC".to_string(), // "mock client"
+        name: "Mock Execution Client".to_string(),
+        version: "0.1.0".to_string(),
+        commit: "0xabcdef01".to_string(),
+    });
 
 mod execution_block_generator;
 mod handle_rpc;
+mod hook;
 mod mock_builder;
 mod mock_execution_layer;
 
 /// Configuration for the MockExecutionLayer.
+#[derive(Clone)]
 pub struct MockExecutionConfig {
     pub server_config: Config,
     pub jwt_key: JwtKey,
-    pub terminal_difficulty: Uint256,
-    pub terminal_block: u64,
-    pub terminal_block_hash: ExecutionBlockHash,
+    pub shanghai_time: Option<u64>,
+    pub cancun_time: Option<u64>,
+    pub prague_time: Option<u64>,
+    pub osaka_time: Option<u64>,
+    pub amsterdam_time: Option<u64>,
 }
 
 impl Default for MockExecutionConfig {
     fn default() -> Self {
         Self {
             jwt_key: JwtKey::random(),
-            terminal_difficulty: DEFAULT_TERMINAL_DIFFICULTY.into(),
-            terminal_block: DEFAULT_TERMINAL_BLOCK,
-            terminal_block_hash: ExecutionBlockHash::zero(),
             server_config: Config::default(),
+            shanghai_time: None,
+            cancun_time: None,
+            prague_time: None,
+            osaka_time: None,
+            amsterdam_time: None,
         }
     }
 }
 
-pub struct MockServer<T: EthSpec> {
+pub struct MockServer<E: EthSpec> {
     _shutdown_tx: oneshot::Sender<()>,
     listen_socket_addr: SocketAddr,
     last_echo_request: Arc<RwLock<Option<Bytes>>>,
-    pub ctx: Arc<Context<T>>,
+    pub ctx: Arc<Context<E>>,
 }
 
-impl<T: EthSpec> MockServer<T> {
+impl<E: EthSpec> MockServer<E> {
     pub fn unit_testing() -> Self {
         Self::new(
             &runtime::Handle::current(),
             JwtKey::from_slice(&DEFAULT_JWT_SECRET).unwrap(),
-            DEFAULT_TERMINAL_DIFFICULTY.into(),
-            DEFAULT_TERMINAL_BLOCK,
-            ExecutionBlockHash::zero(),
+            None, // FIXME(capella): should this be the default?
+            None, // FIXME(deneb): should this be the default?
+            None, // FIXME(electra): should this be the default?
+            None, // FIXME(fulu): should this be the default?
+            None, // FIXME(gloas): should this be the default?
+            None,
         )
     }
 
-    pub fn new_with_config(handle: &runtime::Handle, config: MockExecutionConfig) -> Self {
+    pub fn new_with_config(
+        handle: &runtime::Handle,
+        config: MockExecutionConfig,
+        kzg: Option<Arc<Kzg>>,
+    ) -> Self {
+        create_test_tracing_subscriber();
         let MockExecutionConfig {
             jwt_key,
-            terminal_difficulty,
-            terminal_block,
-            terminal_block_hash,
             server_config,
+            shanghai_time,
+            cancun_time,
+            prague_time,
+            osaka_time,
+            amsterdam_time,
         } = config;
         let last_echo_request = Arc::new(RwLock::new(None));
         let preloaded_responses = Arc::new(Mutex::new(vec![]));
-        let execution_block_generator =
-            ExecutionBlockGenerator::new(terminal_difficulty, terminal_block, terminal_block_hash);
+        let execution_block_generator = ExecutionBlockGenerator::new(
+            shanghai_time,
+            cancun_time,
+            prague_time,
+            osaka_time,
+            amsterdam_time,
+            kzg,
+        );
 
-        let ctx: Arc<Context<T>> = Arc::new(Context {
+        let ctx: Arc<Context<E>> = Arc::new(Context {
             config: server_config,
             jwt_key,
-            log: null_logger().unwrap(),
             last_echo_request: last_echo_request.clone(),
             execution_block_generator: RwLock::new(execution_block_generator),
             previous_request: <_>::default(),
@@ -99,8 +158,11 @@ impl<T: EthSpec> MockServer<T> {
             static_new_payload_response: <_>::default(),
             static_forkchoice_updated_response: <_>::default(),
             static_get_block_by_hash_response: <_>::default(),
+            hook: <_>::default(),
             new_payload_statuses: <_>::default(),
             fcu_payload_statuses: <_>::default(),
+            syncing_response: Arc::new(Mutex::new(Ok(false))),
+            engine_capabilities: Arc::new(RwLock::new(DEFAULT_ENGINE_CAPABILITIES)),
             _phantom: PhantomData,
         });
 
@@ -131,26 +193,37 @@ impl<T: EthSpec> MockServer<T> {
         }
     }
 
+    pub fn set_engine_capabilities(&self, engine_capabilities: EngineCapabilities) {
+        *self.ctx.engine_capabilities.write() = engine_capabilities;
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         handle: &runtime::Handle,
         jwt_key: JwtKey,
-        terminal_difficulty: Uint256,
-        terminal_block: u64,
-        terminal_block_hash: ExecutionBlockHash,
+        shanghai_time: Option<u64>,
+        cancun_time: Option<u64>,
+        prague_time: Option<u64>,
+        osaka_time: Option<u64>,
+        amsterdam_time: Option<u64>,
+        kzg: Option<Arc<Kzg>>,
     ) -> Self {
         Self::new_with_config(
             handle,
             MockExecutionConfig {
                 server_config: Config::default(),
                 jwt_key,
-                terminal_difficulty,
-                terminal_block,
-                terminal_block_hash,
+                shanghai_time,
+                cancun_time,
+                prague_time,
+                osaka_time,
+                amsterdam_time,
             },
+            kzg,
         )
     }
 
-    pub fn execution_block_generator(&self) -> RwLockWriteGuard<'_, ExecutionBlockGenerator<T>> {
+    pub fn execution_block_generator(&self) -> RwLockWriteGuard<'_, ExecutionBlockGenerator<E>> {
         self.ctx.execution_block_generator.write()
     }
 
@@ -359,11 +432,10 @@ impl<T: EthSpec> MockServer<T> {
             .write()
             // The EF tests supply blocks out of order, so we must import them "without checks" and
             // trust they form valid chains.
-            .insert_block_without_checks(block)
-            .unwrap()
+            .insert_block_without_checks(block);
     }
 
-    pub fn get_block(&self, block_hash: ExecutionBlockHash) -> Option<Block<T>> {
+    pub fn get_block(&self, block_hash: ExecutionBlockHash) -> Option<Block<E>> {
         self.ctx
             .execution_block_generator
             .read()
@@ -383,14 +455,25 @@ impl<T: EthSpec> MockServer<T> {
         self.ctx
             .new_payload_statuses
             .lock()
-            .insert(block_hash, status);
+            .insert(block_hash, Ok(status));
     }
 
     pub fn set_fcu_payload_status(&self, block_hash: ExecutionBlockHash, status: PayloadStatusV1) {
         self.ctx
             .fcu_payload_statuses
             .lock()
-            .insert(block_hash, status);
+            .insert(block_hash, Ok(status));
+    }
+
+    pub fn set_new_payload_error(&self, block_hash: ExecutionBlockHash, error: String) {
+        self.ctx
+            .new_payload_statuses
+            .lock()
+            .insert(block_hash, Err(error));
+    }
+
+    pub fn set_syncing_response(&self, res: Result<bool, String>) {
+        *self.ctx.syncing_response.lock() = res;
     }
 }
 
@@ -430,40 +513,45 @@ impl warp::reject::Reject for AuthError {}
 /// A wrapper around all the items required to spawn the HTTP server.
 ///
 /// The server will gracefully handle the case where any fields are `None`.
-pub struct Context<T: EthSpec> {
+pub struct Context<E: EthSpec> {
     pub config: Config,
     pub jwt_key: JwtKey,
-    pub log: Logger,
+
     pub last_echo_request: Arc<RwLock<Option<Bytes>>>,
-    pub execution_block_generator: RwLock<ExecutionBlockGenerator<T>>,
+    pub execution_block_generator: RwLock<ExecutionBlockGenerator<E>>,
     pub preloaded_responses: Arc<Mutex<Vec<serde_json::Value>>>,
     pub previous_request: Arc<Mutex<Option<serde_json::Value>>>,
     pub static_new_payload_response: Arc<Mutex<Option<StaticNewPayloadResponse>>>,
     pub static_forkchoice_updated_response: Arc<Mutex<Option<PayloadStatusV1>>>,
     pub static_get_block_by_hash_response: Arc<Mutex<Option<Option<ExecutionBlock>>>>,
+    pub hook: Arc<Mutex<Hook>>,
 
     // Canned responses by block hash.
     //
     // This is a more flexible and less stateful alternative to `static_new_payload_response`
     // and `preloaded_responses`.
-    pub new_payload_statuses: Arc<Mutex<HashMap<ExecutionBlockHash, PayloadStatusV1>>>,
-    pub fcu_payload_statuses: Arc<Mutex<HashMap<ExecutionBlockHash, PayloadStatusV1>>>,
+    pub new_payload_statuses:
+        Arc<Mutex<HashMap<ExecutionBlockHash, Result<PayloadStatusV1, String>>>>,
+    pub fcu_payload_statuses:
+        Arc<Mutex<HashMap<ExecutionBlockHash, Result<PayloadStatusV1, String>>>>,
+    pub syncing_response: Arc<Mutex<Result<bool, String>>>,
 
-    pub _phantom: PhantomData<T>,
+    pub engine_capabilities: Arc<RwLock<EngineCapabilities>>,
+    pub _phantom: PhantomData<E>,
 }
 
-impl<T: EthSpec> Context<T> {
+impl<E: EthSpec> Context<E> {
     pub fn get_new_payload_status(
         &self,
         block_hash: &ExecutionBlockHash,
-    ) -> Option<PayloadStatusV1> {
+    ) -> Option<Result<PayloadStatusV1, String>> {
         self.new_payload_statuses.lock().get(block_hash).cloned()
     }
 
     pub fn get_fcu_payload_status(
         &self,
         block_hash: &ExecutionBlockHash,
-    ) -> Option<PayloadStatusV1> {
+    ) -> Option<Result<PayloadStatusV1, String>> {
         self.fcu_payload_statuses.lock().get(block_hash).cloned()
     }
 }
@@ -530,8 +618,8 @@ async fn handle_rejection(err: Rejection) -> Result<impl warp::Reply, Infallible
     let code;
     let message;
 
-    if let Some(e) = err.find::<AuthError>() {
-        message = format!("Authorization error: {:?}", e);
+    if let Some(AuthError(e)) = err.find::<AuthError>() {
+        message = format!("Authorization error: {}", e);
         code = StatusCode::UNAUTHORIZED;
     } else {
         message = "BAD_REQUEST".to_string();
@@ -561,12 +649,11 @@ async fn handle_rejection(err: Rejection) -> Result<impl warp::Reply, Infallible
 ///
 /// Returns an error if the server is unable to bind or there is another error during
 /// configuration.
-pub fn serve<T: EthSpec>(
-    ctx: Arc<Context<T>>,
+pub fn serve<E: EthSpec>(
+    ctx: Arc<Context<E>>,
     shutdown: impl Future<Output = ()> + Send + Sync + 'static,
 ) -> Result<(SocketAddr, impl Future<Output = ()>), Error> {
     let config = &ctx.config;
-    let log = ctx.log.clone();
 
     let inner_ctx = ctx.clone();
     let ctx_filter = warp::any().map(move || inner_ctx.clone());
@@ -577,7 +664,7 @@ pub fn serve<T: EthSpec>(
     let root = warp::path::end()
         .and(warp::body::json())
         .and(ctx_filter.clone())
-        .and_then(|body: serde_json::Value, ctx: Arc<Context<T>>| async move {
+        .and_then(|body: serde_json::Value, ctx: Arc<Context<E>>| async move {
             let id = body
                 .get("id")
                 .and_then(serde_json::Value::as_u64)
@@ -600,11 +687,11 @@ pub fn serve<T: EthSpec>(
                         "jsonrpc": JSONRPC_VERSION,
                         "result": result
                     }),
-                    Err(message) => json!({
+                    Err((message, code)) => json!({
                         "id": id,
                         "jsonrpc": JSONRPC_VERSION,
                         "error": {
-                            "code": -1234,   // Junk error code.
+                            "code": code,
                             "message": message
                         }
                     }),
@@ -624,7 +711,7 @@ pub fn serve<T: EthSpec>(
     let echo = warp::path("echo")
         .and(warp::body::bytes())
         .and(ctx_filter)
-        .and_then(|bytes: Bytes, ctx: Arc<Context<T>>| async move {
+        .and_then(|bytes: Bytes, ctx: Arc<Context<E>>| async move {
             *ctx.last_echo_request.write() = Some(bytes.clone());
             Ok::<_, warp::reject::Rejection>(
                 warp::http::Response::builder().status(200).body(bytes),
@@ -646,9 +733,8 @@ pub fn serve<T: EthSpec>(
     )?;
 
     info!(
-        log,
-        "Metrics HTTP server started";
-        "listen_address" => listening_socket.to_string(),
+        listen_address = listening_socket.to_string(),
+        "Mock execution client started"
     );
 
     Ok((listening_socket, server))

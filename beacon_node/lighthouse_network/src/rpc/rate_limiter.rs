@@ -1,14 +1,19 @@
-use crate::rpc::{InboundRequest, Protocol};
+#![deny(clippy::arithmetic_side_effects)]
+
+use super::config::RateLimiterConfig;
+use crate::rpc::Protocol;
 use fnv::FnvHashMap;
 use libp2p::PeerId;
-use std::convert::TryInto;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::hash::Hash;
+use std::num::NonZeroU64;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::time::Interval;
-use types::EthSpec;
+use types::{ChainSpec, Epoch, EthSpec, ForkContext};
 
 /// Nanoseconds since a given time.
 // Maintained as u64 to reduce footprint
@@ -47,12 +52,39 @@ type Nanosecs = u64;
 /// n*`replenish_all_every`/`max_tokens` units of time since their last request.
 ///
 /// To produce hard limits, set `max_tokens` to 1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quota {
     /// How often are `max_tokens` fully replenished.
-    replenish_all_every: Duration,
+    pub(super) replenish_all_every: Duration,
     /// Token limit. This translates on how large can an instantaneous batch of
     /// tokens be.
-    max_tokens: u64,
+    pub(super) max_tokens: NonZeroU64,
+}
+
+impl Quota {
+    /// A hard limit of one token every `seconds`.
+    pub const fn one_every(seconds: u64) -> Self {
+        Quota {
+            replenish_all_every: Duration::from_secs(seconds),
+            max_tokens: NonZeroU64::new(1).unwrap(),
+        }
+    }
+
+    /// Allow `n` tokens to be use used every `seconds`.
+    pub const fn n_every(n: NonZeroU64, seconds: u64) -> Self {
+        Quota {
+            replenish_all_every: Duration::from_secs(seconds),
+            max_tokens: n,
+        }
+    }
+
+    #[cfg(test)]
+    pub const fn n_every_millis(n: NonZeroU64, millis: u64) -> Self {
+        Quota {
+            replenish_all_every: Duration::from_millis(millis),
+            max_tokens: n,
+        }
+    }
 }
 
 /// Manages rate limiting of requests per peer, with differentiated rates per protocol.
@@ -73,9 +105,33 @@ pub struct RPCRateLimiter {
     bbrange_rl: Limiter<PeerId>,
     /// BlocksByRoot rate limiter.
     bbroots_rl: Limiter<PeerId>,
+    /// BlocksByHead rate limiter.
+    bbhead_rl: Limiter<PeerId>,
+    /// BlobsByRange rate limiter.
+    blbrange_rl: Limiter<PeerId>,
+    /// BlobsByRoot rate limiter.
+    blbroot_rl: Limiter<PeerId>,
+    /// PayloadEnvelopesByRange rate limiter.
+    envrange_rl: Limiter<PeerId>,
+    /// PayloadEnvelopesByRoot rate limiter.
+    envroots_rl: Limiter<PeerId>,
+    /// DataColumnsByRoot rate limiter.
+    dcbroot_rl: Limiter<PeerId>,
+    /// DataColumnsByRange rate limiter.
+    dcbrange_rl: Limiter<PeerId>,
+    /// LightClientBootstrap rate limiter.
+    lc_bootstrap_rl: Limiter<PeerId>,
+    /// LightClientOptimisticUpdate rate limiter.
+    lc_optimistic_update_rl: Limiter<PeerId>,
+    /// LightClientFinalityUpdate rate limiter.
+    lc_finality_update_rl: Limiter<PeerId>,
+    /// LightClientUpdatesByRange rate limiter.
+    lc_updates_by_range_rl: Limiter<PeerId>,
+    fork_context: Arc<ForkContext>,
 }
 
 /// Error type for non conformant requests
+#[derive(Debug)]
 pub enum RateLimitedErr {
     /// Required tokens for this request exceed the maximum
     TooLarge,
@@ -84,7 +140,7 @@ pub enum RateLimitedErr {
 }
 
 /// User-friendly builder of a `RPCRateLimiter`
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RPCRateLimiterBuilder {
     /// Quota for the Goodbye protocol.
     goodbye_quota: Option<Quota>,
@@ -98,16 +154,33 @@ pub struct RPCRateLimiterBuilder {
     bbrange_quota: Option<Quota>,
     /// Quota for the BlocksByRoot protocol.
     bbroots_quota: Option<Quota>,
+    /// Quota for the BlocksByHead protocol.
+    bbhead_quota: Option<Quota>,
+    /// Quota for the ExecutionPayloadEnvelopesByRange protocol.
+    perange_quota: Option<Quota>,
+    /// Quota for the ExecutionPayloadEnvelopesByRoot protocol.
+    peroots_quota: Option<Quota>,
+    /// Quota for the BlobsByRange protocol.
+    blbrange_quota: Option<Quota>,
+    /// Quota for the BlobsByRoot protocol.
+    blbroot_quota: Option<Quota>,
+    /// Quota for the DataColumnsByRoot protocol.
+    dcbroot_quota: Option<Quota>,
+    /// Quota for the DataColumnsByRange protocol.
+    dcbrange_quota: Option<Quota>,
+    /// Quota for the LightClientBootstrap protocol.
+    lcbootstrap_quota: Option<Quota>,
+    /// Quota for the LightClientOptimisticUpdate protocol.
+    lc_optimistic_update_quota: Option<Quota>,
+    /// Quota for the LightClientFinalityUpdate protocol.
+    lc_finality_update_quota: Option<Quota>,
+    /// Quota for the LightClientUpdatesByRange protocol.
+    lc_updates_by_range_quota: Option<Quota>,
 }
 
 impl RPCRateLimiterBuilder {
-    /// Get an empty `RPCRateLimiterBuilder`.
-    pub fn new() -> Self {
-        Default::default()
-    }
-
     /// Set a quota for a protocol.
-    fn set_quota(mut self, protocol: Protocol, quota: Quota) -> Self {
+    pub fn set_quota(mut self, protocol: Protocol, quota: Quota) -> Self {
         let q = Some(quota);
         match protocol {
             Protocol::Ping => self.ping_quota = q,
@@ -116,34 +189,22 @@ impl RPCRateLimiterBuilder {
             Protocol::Goodbye => self.goodbye_quota = q,
             Protocol::BlocksByRange => self.bbrange_quota = q,
             Protocol::BlocksByRoot => self.bbroots_quota = q,
+            Protocol::BlocksByHead => self.bbhead_quota = q,
+            Protocol::PayloadEnvelopesByRange => self.perange_quota = q,
+            Protocol::PayloadEnvelopesByRoot => self.peroots_quota = q,
+            Protocol::BlobsByRange => self.blbrange_quota = q,
+            Protocol::BlobsByRoot => self.blbroot_quota = q,
+            Protocol::DataColumnsByRoot => self.dcbroot_quota = q,
+            Protocol::DataColumnsByRange => self.dcbrange_quota = q,
+            Protocol::LightClientBootstrap => self.lcbootstrap_quota = q,
+            Protocol::LightClientOptimisticUpdate => self.lc_optimistic_update_quota = q,
+            Protocol::LightClientFinalityUpdate => self.lc_finality_update_quota = q,
+            Protocol::LightClientUpdatesByRange => self.lc_updates_by_range_quota = q,
         }
         self
     }
 
-    /// Allow one token every `time_period` to be used for this `protocol`.
-    /// This produces a hard limit.
-    pub fn one_every(self, protocol: Protocol, time_period: Duration) -> Self {
-        self.set_quota(
-            protocol,
-            Quota {
-                replenish_all_every: time_period,
-                max_tokens: 1,
-            },
-        )
-    }
-
-    /// Allow `n` tokens to be use used every `time_period` for this `protocol`.
-    pub fn n_every(self, protocol: Protocol, n: u64, time_period: Duration) -> Self {
-        self.set_quota(
-            protocol,
-            Quota {
-                max_tokens: n,
-                replenish_all_every: time_period,
-            },
-        )
-    }
-
-    pub fn build(self) -> Result<RPCRateLimiter, &'static str> {
+    pub fn build(self, fork_context: Arc<ForkContext>) -> Result<RPCRateLimiter, &'static str> {
         // get our quotas
         let ping_quota = self.ping_quota.ok_or("Ping quota not specified")?;
         let metadata_quota = self.metadata_quota.ok_or("MetaData quota not specified")?;
@@ -155,6 +216,42 @@ impl RPCRateLimiterBuilder {
         let bbrange_quota = self
             .bbrange_quota
             .ok_or("BlocksByRange quota not specified")?;
+        let bbhead_quota = self
+            .bbhead_quota
+            .ok_or("BlocksByHead quota not specified")?;
+        let perange_quota = self
+            .perange_quota
+            .ok_or("PayloadEnvelopesByRange quota not specified")?;
+        let peroots_quota = self
+            .peroots_quota
+            .ok_or("PayloadEnvelopesByRoot quota not specified")?;
+        let lc_bootstrap_quota = self
+            .lcbootstrap_quota
+            .ok_or("LightClientBootstrap quota not specified")?;
+        let lc_optimistic_update_quota = self
+            .lc_optimistic_update_quota
+            .ok_or("LightClientOptimisticUpdate quota not specified")?;
+        let lc_finality_update_quota = self
+            .lc_finality_update_quota
+            .ok_or("LightClientFinalityUpdate quota not specified")?;
+        let lc_updates_by_range_quota = self
+            .lc_updates_by_range_quota
+            .ok_or("LightClientUpdatesByRange quota not specified")?;
+
+        let blbrange_quota = self
+            .blbrange_quota
+            .ok_or("BlobsByRange quota not specified")?;
+        let blbroots_quota = self
+            .blbroot_quota
+            .ok_or("BlobsByRoot quota not specified")?;
+
+        let dcbroot_quota = self
+            .dcbroot_quota
+            .ok_or("DataColumnsByRoot quota not specified")?;
+
+        let dcbrange_quota = self
+            .dcbrange_quota
+            .ok_or("DataColumnsByRange quota not specified")?;
 
         // create the rate limiters
         let ping_rl = Limiter::from_quota(ping_quota)?;
@@ -163,10 +260,23 @@ impl RPCRateLimiterBuilder {
         let goodbye_rl = Limiter::from_quota(goodbye_quota)?;
         let bbroots_rl = Limiter::from_quota(bbroots_quota)?;
         let bbrange_rl = Limiter::from_quota(bbrange_quota)?;
+        let bbhead_rl = Limiter::from_quota(bbhead_quota)?;
+        let envrange_rl = Limiter::from_quota(perange_quota)?;
+        let envroots_rl = Limiter::from_quota(peroots_quota)?;
+        let blbrange_rl = Limiter::from_quota(blbrange_quota)?;
+        let blbroot_rl = Limiter::from_quota(blbroots_quota)?;
+        let dcbroot_rl = Limiter::from_quota(dcbroot_quota)?;
+        let dcbrange_rl = Limiter::from_quota(dcbrange_quota)?;
+        let lc_bootstrap_rl = Limiter::from_quota(lc_bootstrap_quota)?;
+        let lc_optimistic_update_rl = Limiter::from_quota(lc_optimistic_update_quota)?;
+        let lc_finality_update_rl = Limiter::from_quota(lc_finality_update_quota)?;
+        let lc_updates_by_range_rl = Limiter::from_quota(lc_updates_by_range_quota)?;
 
         // check for peers to prune every 30 seconds, starting in 30 seconds
         let prune_every = tokio::time::Duration::from_secs(30);
-        let prune_start = tokio::time::Instant::now() + prune_every;
+        let prune_start = tokio::time::Instant::now()
+            .checked_add(prune_every)
+            .ok_or("prune time overflow")?;
         let prune_interval = tokio::time::interval_at(prune_start, prune_every);
         Ok(RPCRateLimiter {
             prune_interval,
@@ -176,19 +286,128 @@ impl RPCRateLimiterBuilder {
             goodbye_rl,
             bbroots_rl,
             bbrange_rl,
+            bbhead_rl,
+            envrange_rl,
+            envroots_rl,
+            blbrange_rl,
+            blbroot_rl,
+            dcbroot_rl,
+            dcbrange_rl,
+            lc_bootstrap_rl,
+            lc_optimistic_update_rl,
+            lc_finality_update_rl,
+            lc_updates_by_range_rl,
             init_time: Instant::now(),
+            fork_context,
         })
     }
 }
 
+pub trait RateLimiterItem {
+    fn protocol(&self) -> Protocol;
+    fn max_responses(&self, digest_epoch: Epoch, spec: &ChainSpec) -> u64;
+}
+
+impl<E: EthSpec> RateLimiterItem for super::RequestType<E> {
+    fn protocol(&self) -> Protocol {
+        self.versioned_protocol().protocol()
+    }
+
+    fn max_responses(&self, digest_epoch: Epoch, spec: &ChainSpec) -> u64 {
+        self.max_responses(digest_epoch, spec)
+    }
+}
+
+impl<E: EthSpec> RateLimiterItem for (super::RpcResponse<E>, Protocol) {
+    fn protocol(&self) -> Protocol {
+        self.1
+    }
+
+    fn max_responses(&self, _digest_epoch: Epoch, _spec: &ChainSpec) -> u64 {
+        // A response chunk consumes one token of the rate limiter.
+        1
+    }
+}
+
 impl RPCRateLimiter {
-    pub fn allows<T: EthSpec>(
+    pub fn new_with_config(
+        config: RateLimiterConfig,
+        fork_context: Arc<ForkContext>,
+    ) -> Result<Self, &'static str> {
+        // Destructure to make sure every configuration value is used.
+        let RateLimiterConfig {
+            ping_quota,
+            meta_data_quota,
+            status_quota,
+            goodbye_quota,
+            blocks_by_range_quota,
+            blocks_by_root_quota,
+            blocks_by_head_quota,
+            payload_envelopes_by_range_quota,
+            payload_envelopes_by_root_quota,
+            blobs_by_range_quota,
+            blobs_by_root_quota,
+            data_columns_by_root_quota,
+            data_columns_by_range_quota,
+            light_client_bootstrap_quota,
+            light_client_optimistic_update_quota,
+            light_client_finality_update_quota,
+            light_client_updates_by_range_quota,
+        } = config;
+
+        Self::builder()
+            .set_quota(Protocol::Ping, ping_quota)
+            .set_quota(Protocol::MetaData, meta_data_quota)
+            .set_quota(Protocol::Status, status_quota)
+            .set_quota(Protocol::Goodbye, goodbye_quota)
+            .set_quota(Protocol::BlocksByRange, blocks_by_range_quota)
+            .set_quota(Protocol::BlocksByRoot, blocks_by_root_quota)
+            .set_quota(Protocol::BlocksByHead, blocks_by_head_quota)
+            .set_quota(
+                Protocol::PayloadEnvelopesByRange,
+                payload_envelopes_by_range_quota,
+            )
+            .set_quota(
+                Protocol::PayloadEnvelopesByRoot,
+                payload_envelopes_by_root_quota,
+            )
+            .set_quota(Protocol::BlobsByRange, blobs_by_range_quota)
+            .set_quota(Protocol::BlobsByRoot, blobs_by_root_quota)
+            .set_quota(Protocol::DataColumnsByRoot, data_columns_by_root_quota)
+            .set_quota(Protocol::DataColumnsByRange, data_columns_by_range_quota)
+            .set_quota(Protocol::LightClientBootstrap, light_client_bootstrap_quota)
+            .set_quota(
+                Protocol::LightClientOptimisticUpdate,
+                light_client_optimistic_update_quota,
+            )
+            .set_quota(
+                Protocol::LightClientFinalityUpdate,
+                light_client_finality_update_quota,
+            )
+            .set_quota(
+                Protocol::LightClientUpdatesByRange,
+                light_client_updates_by_range_quota,
+            )
+            .build(fork_context)
+    }
+
+    /// Get a builder instance.
+    pub fn builder() -> RPCRateLimiterBuilder {
+        RPCRateLimiterBuilder::default()
+    }
+
+    pub fn allows<Item: RateLimiterItem>(
         &mut self,
         peer_id: &PeerId,
-        request: &InboundRequest<T>,
+        request: &Item,
     ) -> Result<(), RateLimitedErr> {
         let time_since_start = self.init_time.elapsed();
-        let tokens = request.expected_responses().max(1);
+        let tokens = request
+            .max_responses(
+                self.fork_context.current_fork_epoch(),
+                &self.fork_context.spec,
+            )
+            .max(1);
 
         let check =
             |limiter: &mut Limiter<PeerId>| limiter.allows(time_since_start, peer_id, tokens);
@@ -199,18 +418,64 @@ impl RPCRateLimiter {
             Protocol::Goodbye => &mut self.goodbye_rl,
             Protocol::BlocksByRange => &mut self.bbrange_rl,
             Protocol::BlocksByRoot => &mut self.bbroots_rl,
+            Protocol::BlocksByHead => &mut self.bbhead_rl,
+            Protocol::PayloadEnvelopesByRange => &mut self.envrange_rl,
+            Protocol::PayloadEnvelopesByRoot => &mut self.envroots_rl,
+            Protocol::BlobsByRange => &mut self.blbrange_rl,
+            Protocol::BlobsByRoot => &mut self.blbroot_rl,
+            Protocol::DataColumnsByRoot => &mut self.dcbroot_rl,
+            Protocol::DataColumnsByRange => &mut self.dcbrange_rl,
+            Protocol::LightClientBootstrap => &mut self.lc_bootstrap_rl,
+            Protocol::LightClientOptimisticUpdate => &mut self.lc_optimistic_update_rl,
+            Protocol::LightClientFinalityUpdate => &mut self.lc_finality_update_rl,
+            Protocol::LightClientUpdatesByRange => &mut self.lc_updates_by_range_rl,
         };
         check(limiter)
     }
 
     pub fn prune(&mut self) {
         let time_since_start = self.init_time.elapsed();
-        self.ping_rl.prune(time_since_start);
-        self.status_rl.prune(time_since_start);
-        self.metadata_rl.prune(time_since_start);
-        self.goodbye_rl.prune(time_since_start);
-        self.bbrange_rl.prune(time_since_start);
-        self.bbroots_rl.prune(time_since_start);
+
+        let Self {
+            prune_interval: _,
+            init_time: _,
+            goodbye_rl,
+            ping_rl,
+            metadata_rl,
+            status_rl,
+            bbrange_rl,
+            bbroots_rl,
+            bbhead_rl,
+            envrange_rl,
+            envroots_rl,
+            blbrange_rl,
+            blbroot_rl,
+            dcbroot_rl,
+            dcbrange_rl,
+            lc_bootstrap_rl,
+            lc_optimistic_update_rl,
+            lc_finality_update_rl,
+            lc_updates_by_range_rl,
+            fork_context: _,
+        } = self;
+
+        goodbye_rl.prune(time_since_start);
+        ping_rl.prune(time_since_start);
+        metadata_rl.prune(time_since_start);
+        status_rl.prune(time_since_start);
+        bbrange_rl.prune(time_since_start);
+        bbroots_rl.prune(time_since_start);
+        bbhead_rl.prune(time_since_start);
+        envrange_rl.prune(time_since_start);
+        envroots_rl.prune(time_since_start);
+        blbrange_rl.prune(time_since_start);
+        blbroot_rl.prune(time_since_start);
+        dcbrange_rl.prune(time_since_start);
+        dcbroot_rl.prune(time_since_start);
+        lc_bootstrap_rl.prune(time_since_start);
+        lc_optimistic_update_rl.prune(time_since_start);
+        lc_finality_update_rl.prune(time_since_start);
+        lc_updates_by_range_rl.prune(time_since_start);
     }
 }
 
@@ -239,14 +504,13 @@ pub struct Limiter<Key: Hash + Eq + Clone> {
 
 impl<Key: Hash + Eq + Clone> Limiter<Key> {
     pub fn from_quota(quota: Quota) -> Result<Self, &'static str> {
-        if quota.max_tokens == 0 {
-            return Err("Max number of tokens should be positive");
-        }
         let tau = quota.replenish_all_every.as_nanos();
         if tau == 0 {
             return Err("Replenish time must be positive");
         }
-        let t = (tau / quota.max_tokens as u128)
+        let t = tau
+            .checked_div(quota.max_tokens.get() as u128)
+            .expect("Division by zero never occurs, since Quota::max_token is of type NonZeroU64.")
             .try_into()
             .map_err(|_| "total replenish time is too long")?;
         let tau = tau
@@ -269,7 +533,7 @@ impl<Key: Hash + Eq + Clone> Limiter<Key> {
         let tau = self.tau;
         let t = self.t;
         // how long does it take to replenish these tokens
-        let additional_time = t * tokens;
+        let additional_time = t.saturating_mul(tokens);
         if additional_time > tau {
             // the time required to process this amount of tokens is longer than the time that
             // makes the bucket full. So, this batch can _never_ be processed
@@ -282,16 +546,16 @@ impl<Key: Hash + Eq + Clone> Limiter<Key> {
             .entry(key.clone())
             .or_insert(time_since_start);
         // check how soon could the request be made
-        let earliest_time = (*tat + additional_time).saturating_sub(tau);
+        let earliest_time = (*tat).saturating_add(additional_time).saturating_sub(tau);
         // earliest_time is in the future
         if time_since_start < earliest_time {
             Err(RateLimitedErr::TooSoon(Duration::from_nanos(
                 /* time they need to wait, i.e. how soon were they */
-                earliest_time - time_since_start,
+                earliest_time.saturating_sub(time_since_start),
             )))
         } else {
             // calculate the new TAT
-            *tat = time_since_start.max(*tat) + additional_time;
+            *tat = time_since_start.max(*tat).saturating_add(additional_time);
             Ok(())
         }
     }
@@ -306,14 +570,15 @@ impl<Key: Hash + Eq + Clone> Limiter<Key> {
 
 #[cfg(test)]
 mod tests {
-    use crate::rpc::rate_limiter::{Limiter, Quota};
+    use crate::rpc::rate_limiter::{Limiter, Quota, RateLimitedErr};
+    use std::num::NonZeroU64;
     use std::time::Duration;
 
     #[test]
     fn it_works_a() {
         let mut limiter = Limiter::from_quota(Quota {
             replenish_all_every: Duration::from_secs(2),
-            max_tokens: 4,
+            max_tokens: NonZeroU64::new(4).unwrap(),
         })
         .unwrap();
         let key = 10;
@@ -325,32 +590,44 @@ mod tests {
         //        |  |  |  |  |
         //        0     1     2
 
-        assert!(limiter
-            .allows(Duration::from_secs_f32(0.0), &key, 4)
-            .is_ok());
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(0.0), &key, 4)
+                .is_ok()
+        );
         limiter.prune(Duration::from_secs_f32(0.1));
-        assert!(limiter
-            .allows(Duration::from_secs_f32(0.1), &key, 1)
-            .is_err());
-        assert!(limiter
-            .allows(Duration::from_secs_f32(0.5), &key, 1)
-            .is_ok());
-        assert!(limiter
-            .allows(Duration::from_secs_f32(1.0), &key, 1)
-            .is_ok());
-        assert!(limiter
-            .allows(Duration::from_secs_f32(1.4), &key, 1)
-            .is_err());
-        assert!(limiter
-            .allows(Duration::from_secs_f32(2.0), &key, 2)
-            .is_ok());
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(0.1), &key, 1)
+                .is_err()
+        );
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(0.5), &key, 1)
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(1.0), &key, 1)
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(1.4), &key, 1)
+                .is_err()
+        );
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(2.0), &key, 2)
+                .is_ok()
+        );
     }
 
     #[test]
     fn it_works_b() {
         let mut limiter = Limiter::from_quota(Quota {
             replenish_all_every: Duration::from_secs(2),
-            max_tokens: 4,
+            max_tokens: NonZeroU64::new(4).unwrap(),
         })
         .unwrap();
         let key = 10;
@@ -358,20 +635,48 @@ mod tests {
         // first half second, when one token will be available again. Check also that before
         // regaining a token, another request is rejected
 
-        assert!(limiter
-            .allows(Duration::from_secs_f32(0.0), &key, 1)
-            .is_ok());
-        assert!(limiter
-            .allows(Duration::from_secs_f32(0.1), &key, 1)
-            .is_ok());
-        assert!(limiter
-            .allows(Duration::from_secs_f32(0.2), &key, 1)
-            .is_ok());
-        assert!(limiter
-            .allows(Duration::from_secs_f32(0.3), &key, 1)
-            .is_ok());
-        assert!(limiter
-            .allows(Duration::from_secs_f32(0.4), &key, 1)
-            .is_err());
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(0.0), &key, 1)
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(0.1), &key, 1)
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(0.2), &key, 1)
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(0.3), &key, 1)
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(0.4), &key, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn large_tokens() {
+        // These have been adjusted so that an overflow occurs when calculating `additional_time` in
+        // `Limiter::allows`. If we don't handle overflow properly, `Limiter::allows` returns `Ok`
+        // in this case.
+        let replenish_all_every = 2;
+        let tokens = u64::MAX / 2 + 1;
+
+        let mut limiter = Limiter::from_quota(Quota {
+            replenish_all_every: Duration::from_nanos(replenish_all_every),
+            max_tokens: NonZeroU64::new(1).unwrap(),
+        })
+        .unwrap();
+
+        let result = limiter.allows(Duration::from_secs_f32(0.0), &10, tokens);
+        assert!(matches!(result, Err(RateLimitedErr::TooLarge)));
     }
 }

@@ -2,6 +2,7 @@
 
 use crate::test_utils::pubkey;
 use crate::*;
+use fixed_bytes::FixedBytesExtended;
 use tempfile::tempdir;
 
 #[test]

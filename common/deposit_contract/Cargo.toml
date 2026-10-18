@@ -2,18 +2,22 @@
 name = "deposit_contract"
 version = "0.2.0"
 authors = ["Paul Hauner <paul@paulhauner.com>"]
-edition = "2021"
+edition = { workspace = true }
 
 build = "build.rs"
 
-[build-dependencies]
-reqwest = { version = "0.11.0", features = ["blocking", "json", "native-tls-vendored"] }
-serde_json = "1.0.58"
-sha2 = "0.10"
-hex = "0.4.2"
-
 [dependencies]
-types = { path = "../../consensus/types"}
-eth2_ssz = "0.4.1"
-tree_hash = "0.4.1"
-ethabi = "16.0.0"
+alloy-dyn-abi = { workspace = true }
+alloy-json-abi = { workspace = true }
+alloy-primitives = { workspace = true }
+bls = { workspace = true }
+ethereum_ssz = { workspace = true }
+serde_json = { workspace = true }
+tree_hash = { workspace = true }
+types = { workspace = true }
+
+[build-dependencies]
+hex = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

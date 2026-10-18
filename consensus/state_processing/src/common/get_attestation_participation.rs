@@ -1,13 +1,13 @@
 use integer_sqrt::IntegerSquareRoot;
+use safe_arith::SafeArith;
 use smallvec::SmallVec;
 use types::{
+    AttestationData, BeaconState, BeaconStateError as Error, ChainSpec, EthSpec,
     consts::altair::{
         NUM_FLAG_INDICES, TIMELY_HEAD_FLAG_INDEX, TIMELY_SOURCE_FLAG_INDEX,
         TIMELY_TARGET_FLAG_INDEX,
     },
-    BeaconStateError as Error,
 };
-use types::{AttestationData, BeaconState, ChainSpec, EthSpec};
 
 /// Get the participation flags for a valid attestation.
 ///
@@ -16,8 +16,10 @@ use types::{AttestationData, BeaconState, ChainSpec, EthSpec};
 ///
 /// This function will return an error if the source of the attestation doesn't match the
 /// state's relevant justified checkpoint.
-pub fn get_attestation_participation_flag_indices<T: EthSpec>(
-    state: &BeaconState<T>,
+///
+/// This function has been abstracted to work for all forks from Altair to Gloas.
+pub fn get_attestation_participation_flag_indices<E: EthSpec>(
+    state: &BeaconState<E>,
     data: &AttestationData,
     inclusion_delay: u64,
     spec: &ChainSpec,
@@ -27,13 +29,43 @@ pub fn get_attestation_participation_flag_indices<T: EthSpec>(
     } else {
         state.previous_justified_checkpoint()
     };
-
-    // Matching roots.
     let is_matching_source = data.source == justified_checkpoint;
+
+    // Matching target.
     let is_matching_target = is_matching_source
         && data.target.root == *state.get_block_root_at_epoch(data.target.epoch)?;
-    let is_matching_head =
-        is_matching_target && data.beacon_block_root == *state.get_block_root(data.slot)?;
+
+    // [New in Gloas:EIP7732]
+    let payload_matches = if state.fork_name_unchecked().gloas_enabled() {
+        if state.is_attestation_same_slot(data)? {
+            // For same-slot attestations, data.index must be 0
+            if data.index != 0 {
+                return Err(Error::BadOverloadedDataIndex(data.index));
+            }
+            true
+        } else {
+            // For non same-slot attestations, check execution payload availability
+            let slot_index = data
+                .slot
+                .as_usize()
+                .safe_rem(E::slots_per_historical_root())?;
+            let payload_index = state
+                .execution_payload_availability()?
+                .get(slot_index)
+                .map(|avail| if avail { 1 } else { 0 })
+                .map_err(|_| Error::InvalidExecutionPayloadAvailabilityIndex(slot_index))?;
+            data.index == payload_index
+        }
+    } else {
+        // Essentially `payload_matches` is always true pre-Gloas (it is not considered for matching
+        // head).
+        true
+    };
+
+    // Matching head.
+    let is_matching_head = is_matching_target
+        && data.beacon_block_root == *state.get_block_root(data.slot)?
+        && payload_matches;
 
     if !is_matching_source {
         return Err(Error::IncorrectAttestationSource);
@@ -41,12 +73,18 @@ pub fn get_attestation_participation_flag_indices<T: EthSpec>(
 
     // Participation flag indices
     let mut participation_flag_indices = SmallVec::new();
-    if is_matching_source && inclusion_delay <= T::slots_per_epoch().integer_sqrt() {
+    if is_matching_source && inclusion_delay <= E::slots_per_epoch().integer_sqrt() {
         participation_flag_indices.push(TIMELY_SOURCE_FLAG_INDEX);
     }
-    if is_matching_target && inclusion_delay <= T::slots_per_epoch() {
+    if state.fork_name_unchecked().deneb_enabled() {
+        if is_matching_target {
+            // [Modified in Deneb:EIP7045]
+            participation_flag_indices.push(TIMELY_TARGET_FLAG_INDEX);
+        }
+    } else if is_matching_target && inclusion_delay <= E::slots_per_epoch() {
         participation_flag_indices.push(TIMELY_TARGET_FLAG_INDEX);
     }
+
     if is_matching_head && inclusion_delay == spec.min_attestation_inclusion_delay {
         participation_flag_indices.push(TIMELY_HEAD_FLAG_INDEX);
     }

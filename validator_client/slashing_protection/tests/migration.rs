@@ -1,4 +1,5 @@
 //! Tests for upgrading a previous version of the database to the latest schema.
+use fixed_bytes::FixedBytesExtended;
 use slashing_protection::{NotSafe, SlashingDatabase};
 use std::collections::HashMap;
 use std::fs;

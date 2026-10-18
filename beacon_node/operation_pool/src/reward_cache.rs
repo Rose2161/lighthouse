@@ -1,5 +1,6 @@
 use crate::OpPoolError;
 use bitvec::vec::BitVec;
+use fixed_bytes::FixedBytesExtended;
 use types::{BeaconState, BeaconStateError, Epoch, EthSpec, Hash256, ParticipationFlags};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -12,7 +13,7 @@ struct Initialization {
 #[derive(Debug, Clone, Default)]
 pub struct RewardCache {
     initialization: Option<Initialization>,
-    /// `BitVec` of validator indices which don't have default participation flags for the prev. epoch.
+    /// `BitVec` of validator indices which don't have default participation flags for the prev epoch.
     ///
     /// We choose to only track whether validators have *any* participation flag set because
     /// it's impossible to include a new attestation which is better than the existing participation
@@ -81,7 +82,7 @@ impl RewardCache {
         if self
             .initialization
             .as_ref()
-            .map_or(true, |init| *init != new_init)
+            .is_none_or(|init| *init != new_init)
         {
             self.update_previous_epoch_participation(state)
                 .map_err(OpPoolError::RewardCacheUpdatePrevEpoch)?;

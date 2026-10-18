@@ -1,15 +1,24 @@
 use crate::metrics;
 use beacon_chain::{
-    merge_readiness::{MergeConfig, MergeReadiness},
     BeaconChain, BeaconChainTypes, ExecutionStatus,
+    bellatrix_readiness::GenesisExecutionPayloadStatus,
 };
-use lighthouse_network::{types::SyncState, NetworkGlobals};
-use slog::{crit, debug, error, info, warn, Logger};
+use execution_layer::{
+    EngineCapabilities,
+    http::{
+        ENGINE_FORKCHOICE_UPDATED_V2, ENGINE_FORKCHOICE_UPDATED_V3, ENGINE_GET_PAYLOAD_V2,
+        ENGINE_GET_PAYLOAD_V3, ENGINE_GET_PAYLOAD_V4, ENGINE_GET_PAYLOAD_V5, ENGINE_GET_PAYLOAD_V6,
+        ENGINE_NEW_PAYLOAD_V2, ENGINE_NEW_PAYLOAD_V3, ENGINE_NEW_PAYLOAD_V4, ENGINE_NEW_PAYLOAD_V5,
+    },
+};
+use lighthouse_network::{NetworkGlobals, types::SyncState};
+use logging::crit;
 use slot_clock::SlotClock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+use tracing::{debug, error, info, warn};
 use types::*;
 
 /// Create a warning log whenever the peer count is at or below this value.
@@ -25,27 +34,28 @@ const SPEEDO_OBSERVATIONS: usize = 4;
 /// The number of slots between logs that give detail about backfill process.
 const BACKFILL_LOG_INTERVAL: u64 = 5;
 
+const SECONDS_IN_A_WEEK: u64 = 604800;
+pub const FORK_READINESS_PREPARATION_SECONDS: u64 = SECONDS_IN_A_WEEK * 2;
+pub const ENGINE_CAPABILITIES_REFRESH_INTERVAL: u64 = 300;
+
 /// Spawns a notifier service which periodically logs information about the node.
 pub fn spawn_notifier<T: BeaconChainTypes>(
     executor: task_executor::TaskExecutor,
     beacon_chain: Arc<BeaconChain<T>>,
     network: Arc<NetworkGlobals<T::EthSpec>>,
-    seconds_per_slot: u64,
+    slot_duration: Duration,
 ) -> Result<(), String> {
-    let slot_duration = Duration::from_secs(seconds_per_slot);
-
     let speedo = Mutex::new(Speedo::default());
-    let log = executor.log().clone();
 
     // Keep track of sync state and reset the speedo on specific sync state changes.
     // Specifically, if we switch between a sync and a backfill sync, reset the speedo.
     let mut current_sync_state = network.sync_state();
 
     // Store info if we are required to do a backfill sync.
-    let original_anchor_slot = beacon_chain
-        .store
-        .get_anchor_info()
-        .map(|ai| ai.oldest_block_slot);
+    let original_oldest_block_slot = beacon_chain.store.get_anchor_info().oldest_block_slot;
+
+    // Use this info during custody backfill sync.
+    let mut original_earliest_data_column_slot = None;
 
     let interval_future = async move {
         // Perform pre-genesis logging.
@@ -55,12 +65,12 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
                 // waiting for genesis.
                 Some(next_slot) if next_slot > slot_duration => {
                     info!(
-                        log,
-                        "Waiting for genesis";
-                        "peers" => peer_count_pretty(network.connected_peers()),
-                        "wait_time" => estimated_time_pretty(Some(next_slot.as_secs() as f64)),
+                        peers = peer_count_pretty(network.connected_peers()),
+                        wait_time = estimated_time_pretty(Some(next_slot.as_secs() as f64)),
+                        "Waiting for genesis"
                     );
-                    eth1_logging(&beacon_chain, &log);
+                    post_bellatrix_readiness_logging(Slot::new(0), &beacon_chain).await;
+                    genesis_execution_payload_logging(&beacon_chain).await;
                     sleep(slot_duration).await;
                 }
                 _ => break,
@@ -69,6 +79,7 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
 
         // Perform post-genesis logging.
         let mut last_backfill_log_slot = None;
+        let mut last_custody_backfill_log_slot = None;
 
         loop {
             // Run the notifier half way through each slot.
@@ -78,7 +89,7 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
             let wait = match beacon_chain.slot_clock.duration_to_next_slot() {
                 Some(duration) => duration + slot_duration / 2,
                 None => {
-                    warn!(log, "Unable to read current slot");
+                    warn!("Unable to read current slot");
                     sleep(slot_duration).await;
                     continue;
                 }
@@ -101,6 +112,18 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
                         let mut speedo = speedo.lock().await;
                         speedo.clear();
                     }
+                    (_, SyncState::CustodyBackFillSyncing { .. }) => {
+                        // We have transitioned to a custody backfill sync. Reset the speedo.
+                        let mut speedo = speedo.lock().await;
+                        last_custody_backfill_log_slot = None;
+                        speedo.clear();
+                    }
+                    (SyncState::CustodyBackFillSyncing { .. }, _) => {
+                        // We have transitioned from a custody backfill sync, reset the speedo
+                        let mut speedo = speedo.lock().await;
+                        last_custody_backfill_log_slot = None;
+                        speedo.clear();
+                    }
                     (_, _) => {}
                 }
                 current_sync_state = sync_state;
@@ -116,11 +139,7 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
             let current_slot = match beacon_chain.slot() {
                 Ok(slot) => slot,
                 Err(e) => {
-                    error!(
-                        log,
-                        "Unable to read current slot";
-                        "error" => format!("{:?}", e)
-                    );
+                    error!(error = ?e, "Unable to read current slot");
                     break;
                 }
             };
@@ -135,20 +154,48 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
             match current_sync_state {
                 SyncState::BackFillSyncing { .. } => {
                     // Observe backfilling sync info.
-                    if let Some(oldest_slot) = original_anchor_slot {
-                        if let Some(current_anchor_slot) = beacon_chain
-                            .store
-                            .get_anchor_info()
-                            .map(|ai| ai.oldest_block_slot)
-                        {
-                            sync_distance = current_anchor_slot;
-                            speedo
-                                // For backfill sync use a fake slot which is the distance we've progressed from the starting `oldest_block_slot`.
-                                .observe(
-                                    oldest_slot.saturating_sub(current_anchor_slot),
-                                    Instant::now(),
+                    let current_oldest_block_slot =
+                        beacon_chain.store.get_anchor_info().oldest_block_slot;
+                    sync_distance = current_oldest_block_slot
+                        .saturating_sub(beacon_chain.genesis_backfill_slot);
+                    speedo
+                        // For backfill sync use a fake slot which is the distance we've progressed
+                        // from the starting `original_oldest_block_slot`.
+                        .observe(
+                            original_oldest_block_slot.saturating_sub(current_oldest_block_slot),
+                            Instant::now(),
+                        );
+                }
+                SyncState::CustodyBackFillSyncing { .. } => {
+                    match beacon_chain.store.get_data_column_custody_info() {
+                        Ok(data_column_custody_info) => {
+                            if let Some(earliest_data_column_slot) = data_column_custody_info
+                                .and_then(|info| info.earliest_data_column_slot)
+                                && let Some(da_boundary) = beacon_chain.get_column_da_boundary()
+                            {
+                                sync_distance = earliest_data_column_slot.saturating_sub(
+                                    da_boundary.start_slot(T::EthSpec::slots_per_epoch()),
                                 );
+
+                                // We keep track of our starting point for custody backfill sync
+                                // so we can measure our speed of progress.
+                                if original_earliest_data_column_slot.is_none() {
+                                    original_earliest_data_column_slot =
+                                        Some(earliest_data_column_slot)
+                                }
+
+                                if let Some(original_earliest_data_column_slot) =
+                                    original_earliest_data_column_slot
+                                {
+                                    speedo.observe(
+                                        original_earliest_data_column_slot
+                                            .saturating_sub(earliest_data_column_slot),
+                                        Instant::now(),
+                                    );
+                                }
+                            }
                         }
+                        Err(e) => error!(error=?e, "Unable to get data column custody info"),
                     }
                 }
                 SyncState::SyncingFinalized { .. }
@@ -168,26 +215,30 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
             );
 
             if connected_peer_count <= WARN_PEER_COUNT {
-                warn!(log, "Low peer count"; "peer_count" => peer_count_pretty(connected_peer_count));
+                warn!(
+                    peer_count = peer_count_pretty(connected_peer_count),
+                    "Low peer count"
+                );
             }
 
             debug!(
-                log,
-                "Slot timer";
-                "peers" => peer_count_pretty(connected_peer_count),
-                "finalized_root" => format!("{}", finalized_checkpoint.root),
-                "finalized_epoch" => finalized_checkpoint.epoch,
-                "head_block" => format!("{}", head_root),
-                "head_slot" => head_slot,
-                "current_slot" => current_slot,
-                "sync_state" =>format!("{}", current_sync_state)
+                peers = peer_count_pretty(connected_peer_count),
+                finalized_root = %finalized_checkpoint.root,
+                finalized_epoch = %finalized_checkpoint.epoch,
+                head_block = %head_root,
+                %head_slot,
+                %current_slot,
+                sync_state = %current_sync_state,
+                "Slot timer"
             );
 
             // Log if we are backfilling.
             let is_backfilling = matches!(current_sync_state, SyncState::BackFillSyncing { .. });
+            let is_custody_backfilling =
+                matches!(current_sync_state, SyncState::CustodyBackFillSyncing { .. });
             if is_backfilling
                 && last_backfill_log_slot
-                    .map_or(true, |slot| slot + BACKFILL_LOG_INTERVAL <= current_slot)
+                    .is_none_or(|slot| slot + BACKFILL_LOG_INTERVAL <= current_slot)
             {
                 last_backfill_log_slot = Some(current_slot);
 
@@ -198,30 +249,80 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
                 );
 
                 let speed = speedo.slots_per_second();
-                let display_speed = speed.map_or(false, |speed| speed != 0.0);
+                let display_speed = speed.is_some_and(|speed| speed != 0.0);
 
                 if display_speed {
                     info!(
-                        log,
-                        "Downloading historical blocks";
-                        "distance" => distance,
-                        "speed" => sync_speed_pretty(speed),
-                        "est_time" => estimated_time_pretty(speedo.estimated_time_till_slot(original_anchor_slot.unwrap_or(current_slot))),
+                        distance,
+                        speed = sync_speed_pretty(speed),
+                        est_time = estimated_time_pretty(
+                            speedo.estimated_time_till_slot(
+                                original_oldest_block_slot
+                                    .saturating_sub(beacon_chain.genesis_backfill_slot)
+                            )
+                        ),
+                        "Downloading historical blocks"
                     );
                 } else {
                     info!(
-                        log,
-                        "Downloading historical blocks";
-                        "distance" => distance,
-                        "est_time" => estimated_time_pretty(speedo.estimated_time_till_slot(original_anchor_slot.unwrap_or(current_slot))),
+                        distance,
+                        est_time = estimated_time_pretty(
+                            speedo.estimated_time_till_slot(
+                                original_oldest_block_slot
+                                    .saturating_sub(beacon_chain.genesis_backfill_slot)
+                            )
+                        ),
+                        "Downloading historical blocks"
                     );
                 }
             } else if !is_backfilling && last_backfill_log_slot.is_some() {
                 last_backfill_log_slot = None;
-                info!(
-                    log,
-                    "Historical block download complete";
+                info!("Historical block download complete");
+            }
+
+            if is_custody_backfilling
+                && last_custody_backfill_log_slot
+                    .is_none_or(|slot| slot + BACKFILL_LOG_INTERVAL <= current_slot)
+            {
+                last_custody_backfill_log_slot = Some(current_slot);
+
+                let distance = format!(
+                    "{} slots ({})",
+                    sync_distance.as_u64(),
+                    slot_distance_pretty(sync_distance, slot_duration)
                 );
+
+                let speed = speedo.slots_per_second();
+                let display_speed = speed.is_some_and(|speed| speed != 0.0);
+                let est_time_in_secs = if let (Some(da_boundary_epoch), Some(original_slot)) = (
+                    beacon_chain.get_column_da_boundary(),
+                    original_earliest_data_column_slot,
+                ) {
+                    let target = original_slot.saturating_sub(
+                        da_boundary_epoch.start_slot(T::EthSpec::slots_per_epoch()),
+                    );
+                    speedo.estimated_time_till_slot(target)
+                } else {
+                    None
+                };
+                if display_speed {
+                    info!(
+                        distance,
+                        speed = sync_speed_pretty(speed),
+                        est_time = estimated_time_pretty(est_time_in_secs),
+                        "Downloading historical data columns"
+                    );
+                } else {
+                    info!(
+                        distance,
+                        est_time = estimated_time_pretty(est_time_in_secs),
+                        "Downloading historical data columns"
+                    );
+                }
+            } else if !is_custody_backfilling && last_custody_backfill_log_slot.is_some() {
+                last_custody_backfill_log_slot = None;
+                original_earliest_data_column_slot = None;
+                info!("Historical data column download complete");
             }
 
             // Log if we are syncing
@@ -234,24 +335,24 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
                 );
 
                 let speed = speedo.slots_per_second();
-                let display_speed = speed.map_or(false, |speed| speed != 0.0);
+                let display_speed = speed.is_some_and(|speed| speed != 0.0);
 
                 if display_speed {
                     info!(
-                        log,
-                        "Syncing";
-                        "peers" => peer_count_pretty(connected_peer_count),
-                        "distance" => distance,
-                        "speed" => sync_speed_pretty(speed),
-                        "est_time" => estimated_time_pretty(speedo.estimated_time_till_slot(current_slot)),
+                        peers = peer_count_pretty(connected_peer_count),
+                        distance,
+                        speed = sync_speed_pretty(speed),
+                        est_time =
+                            estimated_time_pretty(speedo.estimated_time_till_slot(current_slot)),
+                        "Syncing"
                     );
                 } else {
                     info!(
-                        log,
-                        "Syncing";
-                        "peers" => peer_count_pretty(connected_peer_count),
-                        "distance" => distance,
-                        "est_time" => estimated_time_pretty(speedo.estimated_time_till_slot(current_slot)),
+                        peers = peer_count_pretty(connected_peer_count),
+                        distance,
+                        est_time =
+                            estimated_time_pretty(speedo.estimated_time_till_slot(current_slot)),
+                        "Syncing"
                     );
                 }
             } else if current_sync_state.is_synced() {
@@ -259,28 +360,30 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
                 let block_info = if current_slot > head_slot {
                     "   …  empty".to_string()
                 } else {
-                    head_root.to_string()
+                    head_root.short().to_string()
                 };
 
                 let block_hash = match beacon_chain.canonical_head.head_execution_status() {
                     Ok(ExecutionStatus::Irrelevant(_)) => "n/a".to_string(),
-                    Ok(ExecutionStatus::Valid(hash)) => format!("{} (verified)", hash),
+                    Ok(ExecutionStatus::Valid(hash)) => {
+                        metrics::set_gauge(&metrics::IS_OPTIMISTIC_SYNC, 0);
+                        format!("{} (verified)", hash)
+                    }
                     Ok(ExecutionStatus::Optimistic(hash)) => {
+                        metrics::set_gauge(&metrics::IS_OPTIMISTIC_SYNC, 1);
                         warn!(
-                            log,
-                            "Head is optimistic";
-                            "info" => "chain not fully verified, \
-                                block and attestation production disabled until execution engine syncs",
-                            "execution_block_hash" => ?hash,
+                            info = "chain not fully verified, \
+                            block and attestation production disabled until execution engine syncs",
+                            execution_block_hash = ?hash,
+                            "Head is optimistic"
                         );
                         format!("{} (unverified)", hash)
                     }
                     Ok(ExecutionStatus::Invalid(hash)) => {
                         crit!(
-                            log,
-                            "Head execution payload is invalid";
-                            "msg" => "this scenario may be unrecoverable",
-                            "execution_block_hash" => ?hash,
+                            msg = "this scenario may be unrecoverable",
+                            execution_block_hash = ?hash,
+                            "Head execution payload is invalid"
                         );
                         format!("{} (invalid)", hash)
                     }
@@ -288,31 +391,28 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
                 };
 
                 info!(
-                    log,
-                    "Synced";
-                    "peers" => peer_count_pretty(connected_peer_count),
-                    "exec_hash" => block_hash,
-                    "finalized_root" => format!("{}", finalized_checkpoint.root),
-                    "finalized_epoch" => finalized_checkpoint.epoch,
-                    "epoch" => current_epoch,
-                    "block" => block_info,
-                    "slot" => current_slot,
+                    peers = peer_count_pretty(connected_peer_count),
+                    exec_hash = block_hash,
+                    finalized_root = %finalized_checkpoint.root.short(),
+                    finalized_epoch = %finalized_checkpoint.epoch,
+                    epoch = %current_epoch,
+                    block = block_info,
+                    slot = %current_slot,
+                    "Synced"
                 );
             } else {
                 metrics::set_gauge(&metrics::IS_SYNCED, 0);
                 info!(
-                    log,
-                    "Searching for peers";
-                    "peers" => peer_count_pretty(connected_peer_count),
-                    "finalized_root" => format!("{}", finalized_checkpoint.root),
-                    "finalized_epoch" => finalized_checkpoint.epoch,
-                    "head_slot" => head_slot,
-                    "current_slot" => current_slot,
+                    peers = peer_count_pretty(connected_peer_count),
+                    finalized_root = %finalized_checkpoint.root.short(),
+                    finalized_epoch = %finalized_checkpoint.epoch,
+                    %head_slot,
+                    %current_slot,
+                    "Searching for peers"
                 );
             }
 
-            eth1_logging(&beacon_chain, &log);
-            merge_readiness_logging(current_slot, &beacon_chain, &log).await;
+            post_bellatrix_readiness_logging(current_slot, &beacon_chain).await;
         }
     };
 
@@ -322,159 +422,214 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
     Ok(())
 }
 
-/// Provides some helpful logging to users to indicate if their node is ready for the Bellatrix
-/// fork and subsequent merge transition.
-async fn merge_readiness_logging<T: BeaconChainTypes>(
+/// Provides some helpful logging to users to indicate if their node is ready for upcoming forks
+async fn post_bellatrix_readiness_logging<T: BeaconChainTypes>(
     current_slot: Slot,
     beacon_chain: &BeaconChain<T>,
-    log: &Logger,
 ) {
-    let merge_completed = beacon_chain
+    if let Some(fork) = find_next_fork_to_prepare(current_slot, beacon_chain) {
+        let readiness = if let Some(el) = beacon_chain.execution_layer.as_ref() {
+            match el
+                .get_engine_capabilities(Some(Duration::from_secs(
+                    ENGINE_CAPABILITIES_REFRESH_INTERVAL,
+                )))
+                .await
+            {
+                Err(e) => Err(format!("Exchange capabilities failed: {e:?}")),
+                Ok(capabilities) => {
+                    let missing_methods = methods_required_for_fork(fork, capabilities);
+                    if missing_methods.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(format!("Missing required methods: {missing_methods:?}"))
+                    }
+                }
+            }
+        } else {
+            Err("No execution endpoint".to_string())
+        };
+
+        if let Err(readiness) = readiness {
+            warn!(
+                info = %readiness,
+                "Not ready for {}", fork
+            );
+        } else {
+            info!(
+                info = "ensure the execution endpoint is updated to the latest release",
+                "Ready for {}", fork
+            )
+        }
+    }
+}
+
+fn find_next_fork_to_prepare<T: BeaconChainTypes>(
+    current_slot: Slot,
+    beacon_chain: &BeaconChain<T>,
+) -> Option<ForkName> {
+    let head_fork = beacon_chain
         .canonical_head
         .cached_head()
         .snapshot
-        .beacon_block
-        .message()
-        .body()
-        .execution_payload()
-        .map_or(false, |payload| {
-            payload.parent_hash() != ExecutionBlockHash::zero()
-        });
+        .beacon_state
+        .fork_name_unchecked();
 
-    let has_execution_layer = beacon_chain.execution_layer.is_some();
-
-    if merge_completed && has_execution_layer
-        || !beacon_chain.is_time_to_prepare_for_bellatrix(current_slot)
+    // Iterate forks from latest to oldest
+    for (fork, fork_epoch) in ForkName::list_all_fork_epochs(&beacon_chain.spec)
+        .iter()
+        .rev()
     {
-        return;
-    }
-
-    if merge_completed && !has_execution_layer {
-        error!(
-            log,
-            "Execution endpoint required";
-            "info" => "you need an execution engine to validate blocks, see: \
-                       https://lighthouse-book.sigmaprime.io/merge-migration.html"
-        );
-        return;
-    }
-
-    match beacon_chain.check_merge_readiness().await {
-        MergeReadiness::Ready {
-            config,
-            current_difficulty,
-        } => match config {
-            MergeConfig {
-                terminal_total_difficulty: Some(ttd),
-                terminal_block_hash: None,
-                terminal_block_hash_epoch: None,
-            } => {
-                info!(
-                    log,
-                    "Ready for the merge";
-                    "terminal_total_difficulty" => %ttd,
-                    "current_difficulty" => current_difficulty
-                        .map(|d| d.to_string())
-                        .unwrap_or_else(|| "??".into()),
-                )
-            }
-            MergeConfig {
-                terminal_total_difficulty: _,
-                terminal_block_hash: Some(terminal_block_hash),
-                terminal_block_hash_epoch: Some(terminal_block_hash_epoch),
-            } => {
-                info!(
-                    log,
-                    "Ready for the merge";
-                    "info" => "you are using override parameters, please ensure that you \
-                        understand these parameters and their implications.",
-                    "terminal_block_hash" => ?terminal_block_hash,
-                    "terminal_block_hash_epoch" => ?terminal_block_hash_epoch,
-                )
-            }
-            other => error!(
-                log,
-                "Inconsistent merge configuration";
-                "config" => ?other
-            ),
-        },
-        readiness @ MergeReadiness::ExchangeTransitionConfigurationFailed { error: _ } => {
-            error!(
-                log,
-                "Not ready for merge";
-                "info" => %readiness,
-                "hint" => "try updating Lighthouse and/or the execution layer",
-            )
+        // This readiness only handles capella and post fork
+        if *fork <= ForkName::Bellatrix {
+            break;
         }
-        readiness @ MergeReadiness::NotSynced => warn!(
-            log,
-            "Not ready for merge";
-            "info" => %readiness,
-        ),
-        readiness @ MergeReadiness::NoExecutionEndpoint => warn!(
-            log,
-            "Not ready for merge";
-            "info" => %readiness,
-        ),
+
+        // head state has already activated this fork
+        if head_fork >= *fork {
+            break;
+        }
+
+        // Find the first fork that is scheduled and close to happen
+        if let Some(fork_epoch) = fork_epoch {
+            let fork_slot = fork_epoch.start_slot(T::EthSpec::slots_per_epoch());
+            let preparation_slots = FORK_READINESS_PREPARATION_SECONDS
+                / beacon_chain.spec.get_slot_duration().as_secs();
+            let in_fork_preparation_period = current_slot + preparation_slots > fork_slot;
+            if in_fork_preparation_period {
+                return Some(*fork);
+            }
+        }
+    }
+
+    None
+}
+
+fn methods_required_for_fork(
+    fork: ForkName,
+    capabilities: EngineCapabilities,
+) -> Vec<&'static str> {
+    let mut missing_methods = vec![];
+    match fork {
+        ForkName::Base | ForkName::Altair | ForkName::Bellatrix => {
+            warn!(
+                fork = %fork,
+                "Invalid methods_required_for_fork call"
+            );
+        }
+        ForkName::Capella => {
+            if !capabilities.get_payload_v2 {
+                missing_methods.push(ENGINE_GET_PAYLOAD_V2);
+            }
+            if !capabilities.forkchoice_updated_v2 {
+                missing_methods.push(ENGINE_FORKCHOICE_UPDATED_V2);
+            }
+            if !capabilities.new_payload_v2 {
+                missing_methods.push(ENGINE_NEW_PAYLOAD_V2);
+            }
+        }
+        ForkName::Deneb => {
+            if !capabilities.get_payload_v3 {
+                missing_methods.push(ENGINE_GET_PAYLOAD_V3);
+            }
+            if !capabilities.forkchoice_updated_v3 {
+                missing_methods.push(ENGINE_FORKCHOICE_UPDATED_V3);
+            }
+            if !capabilities.new_payload_v3 {
+                missing_methods.push(ENGINE_NEW_PAYLOAD_V3);
+            }
+        }
+        ForkName::Electra => {
+            if !capabilities.get_payload_v4 {
+                missing_methods.push(ENGINE_GET_PAYLOAD_V4);
+            }
+            if !capabilities.new_payload_v4 {
+                missing_methods.push(ENGINE_NEW_PAYLOAD_V4);
+            }
+        }
+        ForkName::Fulu => {
+            if !capabilities.get_payload_v5 {
+                missing_methods.push(ENGINE_GET_PAYLOAD_V5);
+            }
+            if !capabilities.new_payload_v4 {
+                missing_methods.push(ENGINE_NEW_PAYLOAD_V4);
+            }
+        }
+        ForkName::Gloas => {
+            if !capabilities.get_payload_v6 {
+                missing_methods.push(ENGINE_GET_PAYLOAD_V6);
+            }
+            if !capabilities.new_payload_v5 {
+                missing_methods.push(ENGINE_NEW_PAYLOAD_V5);
+            }
+        }
+    }
+    missing_methods
+}
+
+async fn genesis_execution_payload_logging<T: BeaconChainTypes>(beacon_chain: &BeaconChain<T>) {
+    match beacon_chain
+        .check_genesis_execution_payload_is_correct()
+        .await
+    {
+        Ok(GenesisExecutionPayloadStatus::Correct(block_hash)) => {
+            info!(
+                genesis_payload_block_hash = ?block_hash,
+                "Execution enabled from genesis"
+            );
+        }
+        Ok(GenesisExecutionPayloadStatus::BlockHashMismatch { got, expected }) => {
+            error!(
+                info = "genesis is misconfigured and likely to fail",
+                consensus_node_block_hash = ?expected,
+                execution_node_block_hash = ?got,
+                "Genesis payload block hash mismatch"
+            );
+        }
+        Ok(GenesisExecutionPayloadStatus::TransactionsRootMismatch { got, expected }) => {
+            error!(
+                info = "genesis is misconfigured and likely to fail",
+                consensus_node_transactions_root = ?expected,
+                execution_node_transactions_root = ?got,
+                "Genesis payload transactions root mismatch"
+            );
+        }
+        Ok(GenesisExecutionPayloadStatus::WithdrawalsRootMismatch { got, expected }) => {
+            error!(
+                info = "genesis is misconfigured and likely to fail",
+                consensus_node_withdrawals_root = ?expected,
+                execution_node_withdrawals_root = ?got,
+                "Genesis payload withdrawals root mismatch"
+            );
+        }
+        Ok(GenesisExecutionPayloadStatus::OtherMismatch) => {
+            error!(
+                info = "genesis is misconfigured and likely to fail",
+                detail = "see debug logs for payload headers",
+                "Genesis payload header mismatch"
+            );
+        }
+        Ok(GenesisExecutionPayloadStatus::Irrelevant) => {
+            info!("Execution is not enabled from genesis");
+        }
+        Ok(GenesisExecutionPayloadStatus::AlreadyHappened) => {
+            warn!(
+                info = "this is probably a race condition or a bug",
+                "Unable to check genesis which has already occurred"
+            );
+        }
+        Err(e) => {
+            error!(
+                error = ?e,
+                "Unable to check genesis execution payload"
+            );
+        }
     }
 }
 
-fn eth1_logging<T: BeaconChainTypes>(beacon_chain: &BeaconChain<T>, log: &Logger) {
-    let current_slot_opt = beacon_chain.slot().ok();
-
-    // Perform some logging about the eth1 chain
-    if let Some(eth1_chain) = beacon_chain.eth1_chain.as_ref() {
-        // No need to do logging if using the dummy backend.
-        if eth1_chain.is_dummy_backend() {
-            return;
-        }
-
-        if let Some(status) = eth1_chain.sync_status(
-            beacon_chain.genesis_time,
-            current_slot_opt,
-            &beacon_chain.spec,
-        ) {
-            debug!(
-                log,
-                "Eth1 cache sync status";
-                "eth1_head_block" => status.head_block_number,
-                "latest_cached_block_number" => status.latest_cached_block_number,
-                "latest_cached_timestamp" => status.latest_cached_block_timestamp,
-                "voting_target_timestamp" => status.voting_target_timestamp,
-                "ready" => status.lighthouse_is_cached_and_ready
-            );
-
-            if !status.lighthouse_is_cached_and_ready {
-                let voting_target_timestamp = status.voting_target_timestamp;
-
-                let distance = status
-                    .latest_cached_block_timestamp
-                    .map(|latest| {
-                        voting_target_timestamp.saturating_sub(latest)
-                            / beacon_chain.spec.seconds_per_eth1_block
-                    })
-                    .map(|distance| distance.to_string())
-                    .unwrap_or_else(|| "initializing deposits".to_string());
-
-                warn!(
-                    log,
-                    "Syncing deposit contract block cache";
-                    "est_blocks_remaining" => distance,
-                );
-            }
-        } else {
-            error!(
-                log,
-                "Unable to determine deposit contract sync status";
-            );
-        }
-    }
-}
-
-/// Returns the peer count, returning something helpful if it's `usize::max_value` (effectively a
+/// Returns the peer count, returning something helpful if it's `usize::MAX` (effectively a
 /// `None` value).
 fn peer_count_pretty(peer_count: usize) -> String {
-    if peer_count == usize::max_value() {
+    if peer_count == usize::MAX {
         String::from("--")
     } else {
         format!("{}", peer_count)
@@ -574,7 +729,7 @@ impl Speedo {
 
     /// Returns the average of the speeds between each observation.
     ///
-    /// Does not gracefully handle slots that are above `u32::max_value()`.
+    /// Does not gracefully handle slots that are above `u32::MAX`.
     pub fn slots_per_second(&self) -> Option<f64> {
         let speeds = self
             .0

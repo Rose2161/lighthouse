@@ -1,6 +1,11 @@
-use crate::upgrade::{upgrade_to_altair, upgrade_to_bellatrix};
+use crate::upgrade::{
+    upgrade_to_altair, upgrade_to_bellatrix, upgrade_to_capella, upgrade_to_deneb,
+    upgrade_to_electra, upgrade_to_fulu, upgrade_to_gloas,
+};
 use crate::{per_epoch_processing::EpochProcessingSummary, *};
+use fixed_bytes::FixedBytesExtended;
 use safe_arith::{ArithError, SafeArith};
+use tracing::instrument;
 use types::*;
 
 #[derive(Debug, PartialEq)]
@@ -9,6 +14,7 @@ pub enum Error {
     EpochProcessingError(EpochProcessingError),
     ArithError(ArithError),
     InconsistentStateFork(InconsistentFork),
+    BitfieldError(ssz::BitfieldError),
 }
 
 impl From<ArithError> for Error {
@@ -17,16 +23,23 @@ impl From<ArithError> for Error {
     }
 }
 
+impl From<ssz::BitfieldError> for Error {
+    fn from(e: ssz::BitfieldError) -> Self {
+        Self::BitfieldError(e)
+    }
+}
+
 /// Advances a state forward by one slot, performing per-epoch processing if required.
 ///
 /// If the root of the supplied `state` is known, then it can be passed as `state_root`. If
 /// `state_root` is `None`, the root of `state` will be computed using a cached tree hash.
-/// Providing the `state_root` makes this function several orders of magniude faster.
-pub fn per_slot_processing<T: EthSpec>(
-    state: &mut BeaconState<T>,
+/// Providing the `state_root` makes this function several orders of magnitude faster.
+#[instrument(level = "debug", skip_all)]
+pub fn per_slot_processing<E: EthSpec>(
+    state: &mut BeaconState<E>,
     state_root: Option<Hash256>,
     spec: &ChainSpec,
-) -> Result<Option<EpochProcessingSummary<T>>, Error> {
+) -> Result<Option<EpochProcessingSummary<E>>, Error> {
     // Verify that the `BeaconState` instantiation matches the fork at `state.slot()`.
     state
         .fork_name(spec)
@@ -35,33 +48,73 @@ pub fn per_slot_processing<T: EthSpec>(
     cache_state(state, state_root)?;
 
     let summary = if state.slot() > spec.genesis_slot
-        && state.slot().safe_add(1)?.safe_rem(T::slots_per_epoch())? == 0
+        && state.slot().safe_add(1)?.safe_rem(E::slots_per_epoch())? == 0
     {
         Some(per_epoch_processing(state, spec)?)
     } else {
         None
     };
 
+    // Unset the next payload availability
+    if state.fork_name_unchecked().gloas_enabled() {
+        let next_slot_index = state
+            .slot()
+            .as_usize()
+            .safe_add(1)?
+            .safe_rem(E::slots_per_historical_root())?;
+        state
+            .execution_payload_availability_mut()?
+            .set(next_slot_index, false)?;
+    }
+
     state.slot_mut().safe_add_assign(1)?;
 
     // Process fork upgrades here. Note that multiple upgrades can potentially run
     // in sequence if they are scheduled in the same Epoch (common in testnets)
-    if state.slot().safe_rem(T::slots_per_epoch())? == 0 {
+    if state.slot().safe_rem(E::slots_per_epoch())? == 0 {
         // If the Altair fork epoch is reached, perform an irregular state upgrade.
         if spec.altair_fork_epoch == Some(state.current_epoch()) {
             upgrade_to_altair(state, spec)?;
         }
-        // If the Merge fork epoch is reached, perform an irregular state upgrade.
+        // If the Bellatrix fork epoch is reached, perform an irregular state upgrade.
         if spec.bellatrix_fork_epoch == Some(state.current_epoch()) {
             upgrade_to_bellatrix(state, spec)?;
         }
+        // Capella.
+        if spec.capella_fork_epoch == Some(state.current_epoch()) {
+            upgrade_to_capella(state, spec)?;
+        }
+        // Deneb.
+        if spec.deneb_fork_epoch == Some(state.current_epoch()) {
+            upgrade_to_deneb(state, spec)?;
+        }
+        // Electra.
+        if spec.electra_fork_epoch == Some(state.current_epoch()) {
+            upgrade_to_electra(state, spec)?;
+        }
+
+        // Fulu.
+        if spec.fulu_fork_epoch == Some(state.current_epoch()) {
+            upgrade_to_fulu(state, spec)?;
+        }
+
+        // Gloas.
+        if spec.gloas_fork_epoch == Some(state.current_epoch()) {
+            upgrade_to_gloas(state, spec)?;
+        }
+
+        // Additionally build all caches so that all valid states that are advanced always have
+        // committee caches built, and we don't have to worry about initialising them at higher
+        // layers.
+        state.build_caches(spec)?;
     }
 
     Ok(summary)
 }
 
-fn cache_state<T: EthSpec>(
-    state: &mut BeaconState<T>,
+#[instrument(skip_all)]
+fn cache_state<E: EthSpec>(
+    state: &mut BeaconState<E>,
     state_root: Option<Hash256>,
 ) -> Result<(), Error> {
     let previous_state_root = if let Some(root) = state_root {

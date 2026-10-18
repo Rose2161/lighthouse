@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
 
 /// To allow serde to encode/decode byte arrays from HEX ASCII strings.
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -26,9 +25,9 @@ impl From<Vec<u8>> for HexBytes {
     }
 }
 
-impl Into<String> for HexBytes {
-    fn into(self) -> String {
-        hex::encode(self.0)
+impl From<HexBytes> for String {
+    fn from(from: HexBytes) -> String {
+        hex::encode(from.0)
     }
 }
 
@@ -38,7 +37,7 @@ impl TryFrom<String> for HexBytes {
     fn try_from(s: String) -> Result<Self, Self::Error> {
         // Left-pad with a zero if there is not an even number of hex digits to ensure
         // `hex::decode` doesn't return an error.
-        let s = if s.len() % 2 != 0 {
+        let s = if !s.len().is_multiple_of(2) {
             format!("0{}", s)
         } else {
             s

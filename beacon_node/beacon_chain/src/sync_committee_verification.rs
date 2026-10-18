@@ -28,15 +28,14 @@
 
 use crate::observed_attesters::SlotSubcommitteeIndex;
 use crate::{
-    beacon_chain::{MAXIMUM_GOSSIP_CLOCK_DISPARITY, VALIDATOR_PUBKEY_CACHE_LOCK_TIMEOUT},
-    metrics,
-    observed_aggregates::ObserveOutcome,
-    BeaconChain, BeaconChainError, BeaconChainTypes,
+    BeaconChain, BeaconChainError, BeaconChainTypes, metrics, observed_aggregates::ObserveOutcome,
 };
-use bls::{verify_signature_sets, PublicKeyBytes};
-use derivative::Derivative;
+use bls::AggregateSignature;
+use bls::{PublicKeyBytes, verify_signature_sets};
+use educe::Educe;
 use safe_arith::ArithError;
 use slot_clock::SlotClock;
+use ssz_derive::{Decode, Encode};
 use state_processing::per_block_processing::errors::SyncCommitteeMessageValidationError;
 use state_processing::signature_sets::{
     signed_sync_aggregate_selection_proof_signature_set, signed_sync_aggregate_signature_set,
@@ -47,13 +46,15 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use strum::AsRefStr;
 use tree_hash::TreeHash;
+use tree_hash_derive::TreeHash;
+use types::ChainSpec;
+use types::SlotData;
 use types::consts::altair::SYNC_COMMITTEE_SUBNET_COUNT;
-use types::slot_data::SlotData;
-use types::sync_committee::Error as SyncCommitteeError;
+use types::sync_committee::SyncCommitteeError;
 use types::{
-    sync_committee_contribution::Error as ContributionError, AggregateSignature, BeaconStateError,
-    EthSpec, Hash256, SignedContributionAndProof, Slot, SyncCommitteeContribution,
-    SyncCommitteeMessage, SyncSelectionProof, SyncSubnetId,
+    BeaconStateError, EthSpec, Hash256, SignedContributionAndProof, Slot,
+    SyncCommitteeContribution, SyncCommitteeMessage, SyncSelectionProof, SyncSubnetId,
+    sync_committee::SyncCommitteeContributionError as ContributionError,
 };
 
 /// Returned when a sync committee contribution was not successfully verified. It might not have been verified for
@@ -110,14 +111,14 @@ pub enum Error {
     ///
     /// The peer has sent an invalid message.
     AggregatorPubkeyUnknown(u64),
-    /// The sync contribution has been seen before; either in a block, on the gossip network or from a
-    /// local validator.
+    /// The sync contribution or a superset of this sync contribution's aggregation bits for the same data
+    /// has been seen before; either in a block on the gossip network or from a local validator.
     ///
     /// ## Peer scoring
     ///
     /// It's unclear if this sync contribution is valid, however we have already observed it and do not
     /// need to observe it again.
-    SyncContributionAlreadyKnown(Hash256),
+    SyncContributionSupersetKnown(Hash256),
     /// There has already been an aggregation observed for this validator, we refuse to process a
     /// second.
     ///
@@ -153,7 +154,21 @@ pub enum Error {
     /// It's unclear if this sync message is valid, however we have already observed a
     /// signature from this validator for this slot and should not observe
     /// another.
-    PriorSyncCommitteeMessageKnown { validator_index: u64, slot: Slot },
+    PriorSyncCommitteeMessageKnown {
+        validator_index: u64,
+        slot: Slot,
+        prev_root: Hash256,
+        new_root: Hash256,
+    },
+    /// We have already observed a contribution for the aggregator and refuse to
+    /// process another.
+    ///
+    /// ## Peer scoring
+    ///
+    /// It's unclear if this sync message is valid, however we have already observed a
+    /// signature from this validator for this slot and should not observe
+    /// another.
+    PriorSyncContributionMessageKnown { validator_index: u64, slot: Slot },
     /// The sync committee message was received on an invalid sync committee message subnet.
     ///
     /// ## Peer scoring
@@ -175,7 +190,7 @@ pub enum Error {
     ///
     /// We were unable to process this sync committee message due to an internal error. It's unclear if the
     /// sync committee message is valid.
-    BeaconChainError(BeaconChainError),
+    BeaconChainError(Box<BeaconChainError>),
     /// There was an error whilst processing the sync contribution. It is not known if it is valid or invalid.
     ///
     /// ## Peer scoring
@@ -218,7 +233,7 @@ pub enum Error {
 
 impl From<BeaconChainError> for Error {
     fn from(e: BeaconChainError) -> Self {
-        Error::BeaconChainError(e)
+        Error::BeaconChainError(e.into())
     }
 }
 
@@ -247,11 +262,19 @@ impl From<ContributionError> for Error {
 }
 
 /// Wraps a `SignedContributionAndProof` that has been verified for propagation on the gossip network.\
-#[derive(Derivative)]
-#[derivative(Clone(bound = "T: BeaconChainTypes"))]
+#[derive(Educe)]
+#[educe(Clone(bound(T: BeaconChainTypes)))]
 pub struct VerifiedSyncContribution<T: BeaconChainTypes> {
     signed_aggregate: SignedContributionAndProof<T::EthSpec>,
     participant_pubkeys: Vec<PublicKeyBytes>,
+}
+
+/// The sync contribution data.
+#[derive(Encode, Decode, TreeHash)]
+pub struct SyncCommitteeData {
+    pub slot: Slot,
+    pub root: Hash256,
+    pub subcommittee_index: u64,
 }
 
 /// Wraps a `SyncCommitteeMessage` that has been verified for propagation on the gossip network.
@@ -273,7 +296,7 @@ impl<T: BeaconChainTypes> VerifiedSyncContribution<T> {
         let subcommittee_index = contribution.subcommittee_index as usize;
 
         // Ensure sync committee contribution is within the MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance.
-        verify_propagation_slot_range(&chain.slot_clock, contribution)?;
+        verify_propagation_slot_range(&chain.slot_clock, contribution, &chain.spec)?;
 
         // Validate subcommittee index.
         if contribution.subcommittee_index >= SYNC_COMMITTEE_SUBNET_COUNT {
@@ -300,15 +323,22 @@ impl<T: BeaconChainTypes> VerifiedSyncContribution<T> {
             return Err(Error::AggregatorNotInCommittee { aggregator_index });
         };
 
-        // Ensure the valid sync contribution has not already been seen locally.
-        let contribution_root = contribution.tree_hash_root();
+        // Ensure the valid sync contribution or its superset has not already been seen locally.
+        let contribution_data_root = SyncCommitteeData {
+            slot: contribution.slot,
+            root: contribution.beacon_block_root,
+            subcommittee_index: contribution.subcommittee_index,
+        }
+        .tree_hash_root();
+
         if chain
             .observed_sync_contributions
             .write()
-            .is_known(contribution, contribution_root)
-            .map_err(|e| Error::BeaconChainError(e.into()))?
+            .is_known_subset(contribution, contribution_data_root)
+            .map_err(|e| Error::BeaconChainError(Box::new(e.into())))?
         {
-            return Err(Error::SyncContributionAlreadyKnown(contribution_root));
+            metrics::inc_counter(&metrics::SYNC_CONTRIBUTION_SUBSETS);
+            return Err(Error::SyncContributionSupersetKnown(contribution_data_root));
         }
 
         // Ensure there has been no other observed aggregate for the given `aggregator_index`.
@@ -334,7 +364,7 @@ impl<T: BeaconChainTypes> VerifiedSyncContribution<T> {
 
         if !selection_proof
             .is_aggregator::<T::EthSpec>()
-            .map_err(|e| Error::BeaconChainError(e.into()))?
+            .map_err(|e| Error::BeaconChainError(Box::new(e.into())))?
         {
             return Err(Error::InvalidSelectionProof { aggregator_index });
         }
@@ -362,13 +392,14 @@ impl<T: BeaconChainTypes> VerifiedSyncContribution<T> {
         //
         // It's important to double check that the contribution is not already known, otherwise two
         // contribution processed at the same time could be published.
-        if let ObserveOutcome::AlreadyKnown = chain
+        if let ObserveOutcome::Subset = chain
             .observed_sync_contributions
             .write()
-            .observe_item(contribution, Some(contribution_root))
-            .map_err(|e| Error::BeaconChainError(e.into()))?
+            .observe_item(contribution, Some(contribution_data_root))
+            .map_err(|e| Error::BeaconChainError(Box::new(e.into())))?
         {
-            return Err(Error::SyncContributionAlreadyKnown(contribution_root));
+            metrics::inc_counter(&metrics::SYNC_CONTRIBUTION_SUBSETS);
+            return Err(Error::SyncContributionSupersetKnown(contribution_data_root));
         }
 
         // Observe the aggregator so we don't process another aggregate from them.
@@ -378,10 +409,10 @@ impl<T: BeaconChainTypes> VerifiedSyncContribution<T> {
         if chain
             .observed_sync_aggregators
             .write()
-            .observe_validator(observed_key, aggregator_index as usize)
+            .observe_validator(observed_key, aggregator_index as usize, ())
             .map_err(BeaconChainError::from)?
         {
-            return Err(Error::PriorSyncCommitteeMessageKnown {
+            return Err(Error::PriorSyncContributionMessageKnown {
                 validator_index: aggregator_index,
                 slot: contribution.slot,
             });
@@ -428,7 +459,7 @@ impl VerifiedSyncCommitteeMessage {
         // MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance).
         //
         // We do not queue future sync committee messages for later processing.
-        verify_propagation_slot_range(&chain.slot_clock, &sync_message)?;
+        verify_propagation_slot_range(&chain.slot_clock, &sync_message, &chain.spec)?;
 
         // Ensure the `subnet_id` is valid for the given validator.
         let pubkey = chain
@@ -450,18 +481,38 @@ impl VerifiedSyncCommitteeMessage {
         // The sync committee message is the first valid message received for the participating validator
         // for the slot, sync_message.slot.
         let validator_index = sync_message.validator_index;
-        if chain
+        let head_root = chain.canonical_head.cached_head().head_block_root();
+        let new_root = sync_message.beacon_block_root;
+        let should_override_prev = |prev_root: &Hash256, new_root: &Hash256| {
+            let roots_differ = new_root != prev_root;
+            let new_elects_head = new_root == &head_root;
+
+            if roots_differ {
+                // Track sync committee messages that differ from each other.
+                metrics::inc_counter(&metrics::SYNC_MESSAGE_EQUIVOCATIONS);
+                if new_elects_head {
+                    // Track sync committee messages that swap from an old block to a new block.
+                    metrics::inc_counter(&metrics::SYNC_MESSAGE_EQUIVOCATIONS_TO_HEAD);
+                }
+            }
+
+            roots_differ && new_elects_head
+        };
+        if let Some(prev_root) = chain
             .observed_sync_contributors
             .read()
-            .validator_has_been_observed(
+            .observation_for_validator(
                 SlotSubcommitteeIndex::new(sync_message.slot, subnet_id.into()),
                 validator_index as usize,
             )
             .map_err(BeaconChainError::from)?
+            && !should_override_prev(&prev_root, &new_root)
         {
             return Err(Error::PriorSyncCommitteeMessageKnown {
                 validator_index,
                 slot: sync_message.slot,
+                prev_root,
+                new_root,
             });
         }
 
@@ -474,18 +525,22 @@ impl VerifiedSyncCommitteeMessage {
         // It's important to double check that the sync committee message still hasn't been observed, since
         // there can be a race-condition if we receive two sync committee messages at the same time and
         // process them in different threads.
-        if chain
+        if let Some(prev_root) = chain
             .observed_sync_contributors
             .write()
-            .observe_validator(
+            .observe_validator_with_override(
                 SlotSubcommitteeIndex::new(sync_message.slot, subnet_id.into()),
                 validator_index as usize,
+                sync_message.beacon_block_root,
+                should_override_prev,
             )
             .map_err(BeaconChainError::from)?
         {
             return Err(Error::PriorSyncCommitteeMessageKnown {
                 validator_index,
                 slot: sync_message.slot,
+                prev_root,
+                new_root,
             });
         }
 
@@ -519,11 +574,11 @@ impl VerifiedSyncCommitteeMessage {
 pub fn verify_propagation_slot_range<S: SlotClock, U: SlotData>(
     slot_clock: &S,
     sync_contribution: &U,
+    spec: &ChainSpec,
 ) -> Result<(), Error> {
     let message_slot = sync_contribution.get_slot();
-
     let latest_permissible_slot = slot_clock
-        .now_with_future_tolerance(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
+        .now_with_future_tolerance(spec.maximum_gossip_clock_disparity())
         .ok_or(BeaconChainError::UnableToReadSlot)?;
     if message_slot > latest_permissible_slot {
         return Err(Error::FutureSlot {
@@ -533,7 +588,7 @@ pub fn verify_propagation_slot_range<S: SlotClock, U: SlotData>(
     }
 
     let earliest_permissible_slot = slot_clock
-        .now_with_past_tolerance(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
+        .now_with_past_tolerance(spec.maximum_gossip_clock_disparity())
         .ok_or(BeaconChainError::UnableToReadSlot)?;
 
     if message_slot < earliest_permissible_slot {
@@ -563,10 +618,7 @@ pub fn verify_signed_aggregate_signatures<T: BeaconChainTypes>(
     signed_aggregate: &SignedContributionAndProof<T::EthSpec>,
     participant_pubkeys: &[PublicKeyBytes],
 ) -> Result<bool, Error> {
-    let pubkey_cache = chain
-        .validator_pubkey_cache
-        .try_read_for(VALIDATOR_PUBKEY_CACHE_LOCK_TIMEOUT)
-        .ok_or(BeaconChainError::ValidatorPubkeyCacheLockTimeout)?;
+    let pubkey_cache = chain.validator_pubkey_cache.read();
 
     let aggregator_index = signed_aggregate.message.aggregator_index;
     if aggregator_index >= pubkey_cache.len() as u64 {
@@ -577,7 +629,7 @@ pub fn verify_signed_aggregate_signatures<T: BeaconChainTypes>(
         (signed_aggregate.message.contribution.slot + 1).epoch(T::EthSpec::slots_per_epoch());
     let fork = chain.spec.fork_at_epoch(next_slot_epoch);
 
-    let signature_sets = vec![
+    let signature_sets = [
         signed_sync_aggregate_selection_proof_signature_set(
             |validator_index| pubkey_cache.get(validator_index).map(Cow::Borrowed),
             signed_aggregate,
@@ -627,10 +679,7 @@ pub fn verify_sync_committee_message<T: BeaconChainTypes>(
     let signature_setup_timer =
         metrics::start_timer(&metrics::SYNC_MESSAGE_PROCESSING_SIGNATURE_SETUP_TIMES);
 
-    let pubkey_cache = chain
-        .validator_pubkey_cache
-        .try_read_for(VALIDATOR_PUBKEY_CACHE_LOCK_TIMEOUT)
-        .ok_or(BeaconChainError::ValidatorPubkeyCacheLockTimeout)?;
+    let pubkey_cache = chain.validator_pubkey_cache.read();
 
     let pubkey = pubkey_cache
         .get_pubkey_from_pubkey_bytes(pubkey_bytes)
