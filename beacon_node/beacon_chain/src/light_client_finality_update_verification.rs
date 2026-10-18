@@ -1,11 +1,9 @@
-use crate::{BeaconChain, BeaconChainError, BeaconChainTypes};
-use derivative::Derivative;
+use crate::{BeaconChain, BeaconChainTypes};
+use educe::Educe;
 use slot_clock::SlotClock;
 use std::time::Duration;
 use strum::AsRefStr;
-use types::{
-    light_client_update::Error as LightClientUpdateError, LightClientFinalityUpdate, Slot,
-};
+use types::{Hash256, LightClientFinalityUpdate, Slot};
 
 /// Returned when a light client finality update was not successfully verified. It might not have been verified for
 /// two reasons:
@@ -16,8 +14,6 @@ use types::{
 ///   (the `BeaconChainError` variant)
 #[derive(Debug, AsRefStr)]
 pub enum Error {
-    /// Light client finality update message with a lower or equal finalized_header slot already forwarded.
-    FinalityUpdateAlreadySeen,
     /// The light client finality message was received is prior to one-third of slot duration passage. (with
     /// respect to the gossip clock disparity and slot clock duration).
     ///
@@ -25,35 +21,42 @@ pub enum Error {
     ///
     /// Assuming the local clock is correct, the peer has sent an invalid message.
     TooEarly,
-    /// Light client finality update message does not match the locally constructed one.
-    ///
-    /// ## Peer Scoring
-    ///
-    InvalidLightClientFinalityUpdate,
+    /// Light client finalized update message does not match the locally constructed one, it has a
+    /// different signature slot.
+    MismatchedSignatureSlot { local: Slot, observed: Slot },
+    /// Light client finalized update message does not match the locally constructed one, it has a
+    /// different finalized block header for the same signature slot.
+    MismatchedFinalizedHeader {
+        local_finalized_header_root: Hash256,
+        observed_finalized_header_root: Hash256,
+        signature_slot: Slot,
+    },
+    /// Light client finalized update message does not match the locally constructed one, it has a
+    /// different attested block header for the same signature slot and finalized header.
+    MismatchedAttestedHeader {
+        local_attested_header_root: Hash256,
+        observed_attested_header_root: Hash256,
+        finalized_header_root: Hash256,
+        signature_slot: Slot,
+    },
+    /// Light client finalized update message does not match the locally constructed one, it has a
+    /// different proof or sync aggregate for the same slot, attested header and finalized header.
+    MismatchedProofOrSyncAggregate {
+        attested_header_root: Hash256,
+        finalized_header_root: Hash256,
+        signature_slot: Slot,
+    },
     /// Signature slot start time is none.
     SigSlotStartIsNone,
     /// Failed to construct a LightClientFinalityUpdate from state.
     FailedConstructingUpdate,
-    /// Beacon chain error occured.
-    BeaconChainError(BeaconChainError),
-    LightClientUpdateError(LightClientUpdateError),
-}
-
-impl From<BeaconChainError> for Error {
-    fn from(e: BeaconChainError) -> Self {
-        Error::BeaconChainError(e)
-    }
-}
-
-impl From<LightClientUpdateError> for Error {
-    fn from(e: LightClientUpdateError) -> Self {
-        Error::LightClientUpdateError(e)
-    }
+    /// Silently ignore this light client finality update
+    Ignore,
 }
 
 /// Wraps a `LightClientFinalityUpdate` that has been verified for propagation on the gossip network.
-#[derive(Derivative)]
-#[derivative(Clone(bound = "T: BeaconChainTypes"))]
+#[derive(Educe)]
+#[educe(Clone(bound(T: BeaconChainTypes)))]
 pub struct VerifiedLightClientFinalityUpdate<T: BeaconChainTypes> {
     light_client_finality_update: LightClientFinalityUpdate<T::EthSpec>,
     seen_timestamp: Duration,
@@ -63,71 +66,100 @@ impl<T: BeaconChainTypes> VerifiedLightClientFinalityUpdate<T> {
     /// Returns `Ok(Self)` if the `light_client_finality_update` is valid to be (re)published on the gossip
     /// network.
     pub fn verify(
-        light_client_finality_update: LightClientFinalityUpdate<T::EthSpec>,
+        rcv_finality_update: LightClientFinalityUpdate<T::EthSpec>,
         chain: &BeaconChain<T>,
         seen_timestamp: Duration,
     ) -> Result<Self, Error> {
-        let gossiped_finality_slot = light_client_finality_update.finalized_header.slot;
-        let one_third_slot_duration = Duration::new(chain.spec.seconds_per_slot / 3, 0);
-        let signature_slot = light_client_finality_update.signature_slot;
-        let start_time = chain.slot_clock.start_of(signature_slot);
-        let mut latest_seen_finality_update = chain.latest_seen_finality_update.lock();
-
-        let head = chain.canonical_head.cached_head();
-        let head_block = &head.snapshot.beacon_block;
-        let attested_block_root = head_block.message().parent_root();
-        let attested_block = chain
-            .get_blinded_block(&attested_block_root)?
-            .ok_or(Error::FailedConstructingUpdate)?;
-        let mut attested_state = chain
-            .get_state(&attested_block.state_root(), Some(attested_block.slot()))?
-            .ok_or(Error::FailedConstructingUpdate)?;
-
-        let finalized_block_root = attested_state.finalized_checkpoint().root;
-        let finalized_block = chain
-            .get_blinded_block(&finalized_block_root)?
-            .ok_or(Error::FailedConstructingUpdate)?;
-        let latest_seen_finality_update_slot = match latest_seen_finality_update.as_ref() {
-            Some(update) => update.finalized_header.slot,
-            None => Slot::new(0),
-        };
-
-        // verify that no other finality_update with a lower or equal
-        // finalized_header.slot was already forwarded on the network
-        if gossiped_finality_slot <= latest_seen_finality_update_slot {
-            return Err(Error::FinalityUpdateAlreadySeen);
-        }
-
         // verify that enough time has passed for the block to have been propagated
-        match start_time {
-            Some(time) => {
-                if seen_timestamp + chain.spec.maximum_gossip_clock_disparity()
-                    < time + one_third_slot_duration
-                {
-                    return Err(Error::TooEarly);
-                }
+        let start_time = chain
+            .slot_clock
+            .start_of(rcv_finality_update.signature_slot())
+            .ok_or(Error::SigSlotStartIsNone)?;
+        let sync_message_due = chain.spec.get_sync_message_due();
+        if seen_timestamp + chain.spec.maximum_gossip_clock_disparity()
+            < start_time + sync_message_due
+        {
+            return Err(Error::TooEarly);
+        }
+
+        if let Some(latest_broadcasted_finality_update) = chain
+            .light_client_server_cache
+            .get_latest_broadcasted_finality_update()
+        {
+            // Ignore the incoming finality update if we've already broadcasted it
+            if latest_broadcasted_finality_update == rcv_finality_update {
+                return Err(Error::Ignore);
             }
-            None => return Err(Error::SigSlotStartIsNone),
+
+            // Ignore the incoming finality update if the latest broadcasted attested header slot
+            // is greater than the incoming attested header slot.
+            if latest_broadcasted_finality_update.get_attested_header_slot()
+                > rcv_finality_update.get_attested_header_slot()
+            {
+                return Err(Error::Ignore);
+            }
         }
 
-        let head_state = &head.snapshot.beacon_state;
-        let finality_update = LightClientFinalityUpdate::new(
-            &chain.spec,
-            head_state,
-            head_block,
-            &mut attested_state,
-            &finalized_block,
-        )?;
+        let latest_finality_update = chain
+            .light_client_server_cache
+            .get_latest_finality_update()
+            .ok_or(Error::FailedConstructingUpdate)?;
 
-        // verify that the gossiped finality update is the same as the locally constructed one.
-        if finality_update != light_client_finality_update {
-            return Err(Error::InvalidLightClientFinalityUpdate);
+        // Ignore the incoming finality update if the latest constructed attested header slot
+        // is greater than the incoming attested header slot.
+        if latest_finality_update.get_attested_header_slot()
+            > rcv_finality_update.get_attested_header_slot()
+        {
+            return Err(Error::Ignore);
         }
 
-        *latest_seen_finality_update = Some(light_client_finality_update.clone());
+        // Verify that the gossiped finality update is the same as the locally constructed one.
+        if latest_finality_update != rcv_finality_update {
+            let signature_slot = latest_finality_update.signature_slot();
+
+            if signature_slot != rcv_finality_update.signature_slot() {
+                // The locally constructed finality update is not up to date, probably
+                // because the node has fallen behind and needs to sync.
+                if rcv_finality_update.signature_slot() > signature_slot {
+                    return Err(Error::Ignore);
+                }
+                return Err(Error::MismatchedSignatureSlot {
+                    local: signature_slot,
+                    observed: rcv_finality_update.signature_slot(),
+                });
+            }
+            let local_finalized_header_root = latest_finality_update.get_finalized_header_root();
+            let observed_finalized_header_root = rcv_finality_update.get_finalized_header_root();
+            if local_finalized_header_root != observed_finalized_header_root {
+                return Err(Error::MismatchedFinalizedHeader {
+                    local_finalized_header_root,
+                    observed_finalized_header_root,
+                    signature_slot,
+                });
+            }
+            let local_attested_header_root = latest_finality_update.get_attested_header_root();
+            let observed_attested_header_root = rcv_finality_update.get_attested_header_root();
+            if local_attested_header_root != observed_attested_header_root {
+                return Err(Error::MismatchedAttestedHeader {
+                    local_attested_header_root,
+                    observed_attested_header_root,
+                    finalized_header_root: local_finalized_header_root,
+                    signature_slot,
+                });
+            }
+            return Err(Error::MismatchedProofOrSyncAggregate {
+                attested_header_root: local_attested_header_root,
+                finalized_header_root: local_finalized_header_root,
+                signature_slot,
+            });
+        }
+
+        chain
+            .light_client_server_cache
+            .set_latest_broadcasted_finality_update(rcv_finality_update.clone());
 
         Ok(Self {
-            light_client_finality_update,
+            light_client_finality_update: rcv_finality_update,
             seen_timestamp,
         })
     }

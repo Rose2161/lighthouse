@@ -1,10 +1,8 @@
-use serde_derive::Deserialize;
+use context_deserialize::ContextDeserialize;
+use serde::{Deserialize, Deserializer};
 use ssz::Encode;
 use ssz_derive::{Decode, Encode};
-use std::convert::TryFrom;
 use std::fmt::Debug;
-use tree_hash::TreeHash;
-use types::ForkName;
 
 /// Macro to wrap U128 and U256 so they deserialize correctly.
 macro_rules! uint_wrapper {
@@ -19,7 +17,7 @@ macro_rules! uint_wrapper {
             type Error = String;
 
             fn try_from(s: String) -> Result<Self, Self::Error> {
-                <$wrapped_type>::from_dec_str(&s)
+                <$wrapped_type>::from_str_radix(&s, 10)
                     .map(|x| Self { x })
                     .map_err(|e| format!("{:?}", e))
             }
@@ -42,32 +40,25 @@ macro_rules! uint_wrapper {
                 self.x.tree_hash_root()
             }
         }
+
+        impl<'de, T> ContextDeserialize<'de, T> for $wrapper_name {
+            fn context_deserialize<D>(deserializer: D, _context: T) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                <$wrapper_name>::deserialize(deserializer)
+            }
+        }
     };
 }
 
-uint_wrapper!(TestU128, ethereum_types::U128);
-uint_wrapper!(TestU256, ethereum_types::U256);
+uint_wrapper!(DecimalU128, alloy_primitives::U128);
+uint_wrapper!(DecimalU256, alloy_primitives::U256);
 
 /// Trait for types that can be used in SSZ static tests.
-pub trait SszStaticType:
-    serde::de::DeserializeOwned + Encode + TreeHash + Clone + PartialEq + Debug + Sync
-{
-}
+pub trait SszStaticType: Encode + Clone + PartialEq + Debug + Sync {}
 
-impl<T> SszStaticType for T where
-    T: serde::de::DeserializeOwned + Encode + TreeHash + Clone + PartialEq + Debug + Sync
-{
-}
-
-/// Return the fork immediately prior to a fork.
-pub fn previous_fork(fork_name: ForkName) -> ForkName {
-    match fork_name {
-        ForkName::Base => ForkName::Base,
-        ForkName::Altair => ForkName::Base,
-        ForkName::Merge => ForkName::Altair, // TODO: Check this when tests are released..
-        ForkName::Capella => ForkName::Merge, // TODO: Check this when tests are released..
-    }
-}
+impl<T> SszStaticType for T where T: Encode + Clone + PartialEq + Debug + Sync {}
 
 #[macro_export]
 macro_rules! impl_bls_load_case {

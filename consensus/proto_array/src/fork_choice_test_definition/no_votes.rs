@@ -1,3 +1,5 @@
+use fixed_bytes::FixedBytesExtended;
+
 use super::*;
 
 pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
@@ -16,6 +18,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
             },
             justified_state_balances: balances.clone(),
             expected_head: Hash256::zero(),
+            current_slot: Slot::new(0),
+            expected_payload_status: None,
         },
         // Add block 2
         //
@@ -34,6 +38,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
                 epoch: Epoch::new(1),
                 root: Hash256::zero(),
             },
+            execution_payload_parent_hash: None,
+            execution_payload_block_hash: None,
         },
         // Ensure the head is 2
         //
@@ -51,6 +57,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
             },
             justified_state_balances: balances.clone(),
             expected_head: get_root(2),
+            current_slot: Slot::new(0),
+            expected_payload_status: None,
         },
         // Add block 1
         //
@@ -69,6 +77,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
                 epoch: Epoch::new(1),
                 root: Hash256::zero(),
             },
+            execution_payload_parent_hash: None,
+            execution_payload_block_hash: None,
         },
         // Ensure the head is still 2
         //
@@ -86,6 +96,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
             },
             justified_state_balances: balances.clone(),
             expected_head: get_root(2),
+            current_slot: Slot::new(0),
+            expected_payload_status: None,
         },
         // Add block 3
         //
@@ -106,6 +118,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
                 epoch: Epoch::new(1),
                 root: Hash256::zero(),
             },
+            execution_payload_parent_hash: None,
+            execution_payload_block_hash: None,
         },
         // Ensure 2 is still the head
         //
@@ -125,6 +139,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
             },
             justified_state_balances: balances.clone(),
             expected_head: get_root(2),
+            current_slot: Slot::new(0),
+            expected_payload_status: None,
         },
         // Add block 4
         //
@@ -145,6 +161,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
                 epoch: Epoch::new(1),
                 root: Hash256::zero(),
             },
+            execution_payload_parent_hash: None,
+            execution_payload_block_hash: None,
         },
         // Ensure the head is 4.
         //
@@ -164,6 +182,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
             },
             justified_state_balances: balances.clone(),
             expected_head: get_root(4),
+            current_slot: Slot::new(0),
+            expected_payload_status: None,
         },
         // Add block 5 with a justified epoch of 2
         //
@@ -183,8 +203,10 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
                 epoch: Epoch::new(1),
                 root: Hash256::zero(),
             },
+            execution_payload_parent_hash: None,
+            execution_payload_block_hash: None,
         },
-        // Ensure the head is still 4 whilst the justified epoch is 0.
+        // Ensure the head is now 5 whilst the justified epoch is 0.
         //
         //         0
         //        / \
@@ -203,9 +225,12 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
                 root: Hash256::zero(),
             },
             justified_state_balances: balances.clone(),
-            expected_head: get_root(4),
+            expected_head: get_root(5),
+            current_slot: Slot::new(0),
+            expected_payload_status: None,
         },
-        // Ensure there is an error when starting from a block that has the wrong justified epoch.
+        // Ensure there is no error when starting from a block that has the
+        // wrong justified epoch.
         //
         //      0
         //     / \
@@ -214,7 +239,11 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
         //     4  3
         //     |
         //     5 <- starting from 5 with justified epoch 0 should error.
-        Operation::InvalidFindHead {
+        //
+        // Since https://github.com/ethereum/consensus-specs/pull/3431 it is valid
+        // to elect head blocks that have a higher justified checkpoint than the
+        // store.
+        Operation::FindHead {
             justified_checkpoint: Checkpoint {
                 epoch: Epoch::new(1),
                 root: get_root(5),
@@ -224,6 +253,9 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
                 root: Hash256::zero(),
             },
             justified_state_balances: balances.clone(),
+            expected_head: get_root(5),
+            current_slot: Slot::new(0),
+            expected_payload_status: None,
         },
         // Set the justified epoch to 2 and the start block to 5 and ensure 5 is the head.
         //
@@ -242,6 +274,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
             },
             justified_state_balances: balances.clone(),
             expected_head: get_root(5),
+            current_slot: Slot::new(0),
+            expected_payload_status: None,
         },
         // Add block 6
         //
@@ -263,6 +297,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
                 epoch: Epoch::new(1),
                 root: Hash256::zero(),
             },
+            execution_payload_parent_hash: None,
+            execution_payload_block_hash: None,
         },
         // Ensure 6 is the head
         //
@@ -283,6 +319,8 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
             },
             justified_state_balances: balances,
             expected_head: get_root(6),
+            current_slot: Slot::new(0),
+            expected_payload_status: None,
         },
     ];
 
@@ -297,6 +335,9 @@ pub fn get_no_votes_test_definition() -> ForkChoiceTestDefinition {
             root: Hash256::zero(),
         },
         operations,
+        execution_payload_parent_hash: None,
+        execution_payload_block_hash: None,
+        spec: None,
     }
 }
 

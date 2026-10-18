@@ -4,7 +4,8 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
-use types::{BeaconBlockRef, Epoch, EthSpec, Hash256, Slot, Unsigned};
+use typenum::Unsigned;
+use types::{BeaconBlockRef, Epoch, EthSpec, Hash256, Slot};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -16,9 +17,15 @@ pub enum Error {
 }
 
 #[derive(Eq, Hash, PartialEq, Debug, Default)]
-struct ProposalKey {
-    slot: Slot,
-    proposer: u64,
+pub struct ProposalKey {
+    pub slot: Slot,
+    pub proposer: u64,
+}
+
+impl ProposalKey {
+    pub fn new(proposer: u64, slot: Slot) -> Self {
+        Self { slot, proposer }
+    }
 }
 
 /// Maintains a cache of observed `(block.slot, block.proposer)`.

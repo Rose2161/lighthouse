@@ -13,30 +13,31 @@
 
 use bytes::Bytes;
 use discv5::enr::{CombinedKey, Enr};
-use eth2_config::{instantiate_hardcoded_nets, HardcodedNet};
+use eth2_config::{HardcodedNet, instantiate_hardcoded_nets};
+use kzg::trusted_setup::get_trusted_setup;
 use pretty_reqwest_error::PrettyReqwestError;
 use reqwest::{Client, Error};
 use sensitive_url::SensitiveUrl;
 use sha2::{Digest, Sha256};
-use slog::{info, warn, Logger};
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
+use tracing::{info, warn};
 use types::{BeaconState, ChainSpec, Config, EthSpec, EthSpecId, Hash256};
 use url::Url;
 
 pub use eth2_config::GenesisStateSource;
 
-pub const DEPLOY_BLOCK_FILE: &str = "deploy_block.txt";
-pub const BOOT_ENR_FILE: &str = "boot_enr.yaml";
+pub const DEPLOY_BLOCK_FILE: &str = "deposit_contract_block.txt";
+pub const BOOT_ENR_FILE: &str = "bootstrap_nodes.yaml";
 pub const GENESIS_STATE_FILE: &str = "genesis.ssz";
 pub const BASE_CONFIG_FILE: &str = "config.yaml";
 
 // Creates definitions for:
 //
-// - Each of the `HardcodedNet` values (e.g., `MAINNET`, `PRATER`, etc).
+// - Each of the `HardcodedNet` values (e.g., `MAINNET`, `HOLESKY`, etc).
 // - `HARDCODED_NETS: &[HardcodedNet]`
 // - `HARDCODED_NET_NAMES: &[&'static str]`
 instantiate_hardcoded_nets!(eth2_config);
@@ -84,6 +85,7 @@ pub struct Eth2NetworkConfig {
     pub genesis_state_source: GenesisStateSource,
     pub genesis_state_bytes: Option<GenesisStateBytes>,
     pub config: Config,
+    pub kzg_trusted_setup: Vec<u8>,
 }
 
 impl Eth2NetworkConfig {
@@ -99,19 +101,22 @@ impl Eth2NetworkConfig {
 
     /// Instantiates `Self` from a `HardcodedNet`.
     fn from_hardcoded_net(net: &HardcodedNet) -> Result<Self, String> {
+        let config: Config = yaml_serde::from_reader(net.config)
+            .map_err(|e| format!("Unable to parse yaml config: {:?}", e))?;
+        let kzg_trusted_setup = get_trusted_setup();
         Ok(Self {
-            deposit_contract_deploy_block: serde_yaml::from_reader(net.deploy_block)
+            deposit_contract_deploy_block: yaml_serde::from_reader(net.deploy_block)
                 .map_err(|e| format!("Unable to parse deploy block: {:?}", e))?,
             boot_enr: Some(
-                serde_yaml::from_reader(net.boot_enr)
+                yaml_serde::from_reader(net.boot_enr)
                     .map_err(|e| format!("Unable to parse boot enr: {:?}", e))?,
             ),
             genesis_state_source: net.genesis_state_source,
             genesis_state_bytes: Some(net.genesis_state_bytes)
                 .filter(|bytes| !bytes.is_empty())
                 .map(Into::into),
-            config: serde_yaml::from_reader(net.config)
-                .map_err(|e| format!("Unable to parse yaml config: {:?}", e))?,
+            config,
+            kzg_trusted_setup,
         })
     }
 
@@ -126,6 +131,16 @@ impl Eth2NetworkConfig {
     /// Returns `true` if this configuration contains a `BeaconState`.
     pub fn genesis_state_is_known(&self) -> bool {
         self.genesis_state_source != GenesisStateSource::Unknown
+    }
+
+    /// The `genesis_time` of the genesis state.
+    pub fn genesis_time<E: EthSpec>(&self) -> Result<Option<u64>, String> {
+        if let GenesisStateSource::Url { genesis_time, .. } = self.genesis_state_source {
+            Ok(Some(genesis_time))
+        } else {
+            self.get_genesis_state_from_bytes::<E>()
+                .map(|state| Some(state.genesis_time()))
+        }
     }
 
     /// The `genesis_validators_root` of the genesis state.
@@ -149,6 +164,32 @@ impl Eth2NetworkConfig {
         }
     }
 
+    /// Get the genesis state root for this network.
+    ///
+    /// `Ok(None)` will be returned if the genesis state is not known. No network requests will be
+    /// made by this function. This function will not error unless the genesis state configuration
+    /// is corrupted.
+    pub fn genesis_state_root<E: EthSpec>(&self) -> Result<Option<Hash256>, String> {
+        match self.genesis_state_source {
+            GenesisStateSource::Unknown => Ok(None),
+            GenesisStateSource::Url {
+                genesis_state_root, ..
+            } => Hash256::from_str(genesis_state_root)
+                .map(Option::Some)
+                .map_err(|e| format!("Unable to parse genesis state root: {:?}", e)),
+            GenesisStateSource::IncludedBytes => {
+                self.get_genesis_state_from_bytes::<E>()
+                    .and_then(|mut state| {
+                        Ok(Some(
+                            state
+                                .canonical_root()
+                                .map_err(|e| format!("Hashing error: {e:?}"))?,
+                        ))
+                    })
+            }
+        }
+    }
+
     /// Construct a consolidated `ChainSpec` from the YAML config.
     pub fn chain_spec<E: EthSpec>(&self) -> Result<ChainSpec, String> {
         ChainSpec::from_config::<E>(&self.config).ok_or_else(|| {
@@ -167,7 +208,6 @@ impl Eth2NetworkConfig {
         &self,
         genesis_state_url: Option<&str>,
         timeout: Duration,
-        log: &Logger,
     ) -> Result<Option<BeaconState<E>>, String> {
         let spec = self.chain_spec::<E>()?;
         match &self.genesis_state_source {
@@ -180,14 +220,15 @@ impl Eth2NetworkConfig {
                 urls: built_in_urls,
                 checksum,
                 genesis_validators_root,
+                ..
             } => {
                 let checksum = Hash256::from_str(checksum).map_err(|e| {
                     format!("Unable to parse genesis state bytes checksum: {:?}", e)
                 })?;
                 let bytes = if let Some(specified_url) = genesis_state_url {
-                    download_genesis_state(&[specified_url], timeout, checksum, log).await
+                    download_genesis_state(&[specified_url], timeout, checksum).await
                 } else {
-                    download_genesis_state(built_in_urls, timeout, checksum, log).await
+                    download_genesis_state(built_in_urls, timeout, checksum).await
                 }?;
                 let state = BeaconState::from_ssz_bytes(bytes.as_ref(), &spec).map_err(|e| {
                     format!("Downloaded genesis state SSZ bytes are invalid: {:?}", e)
@@ -245,7 +286,7 @@ impl Eth2NetworkConfig {
                 File::create(base_dir.join($file))
                     .map_err(|e| format!("Unable to create {}: {:?}", $file, e))
                     .and_then(|mut file| {
-                        let yaml = serde_yaml::to_string(&$variable)
+                        let yaml = yaml_serde::to_string(&$variable)
                             .map_err(|e| format!("Unable to YAML encode {}: {:?}", $file, e))?;
 
                         // Remove the doc header from the YAML file.
@@ -293,7 +334,7 @@ impl Eth2NetworkConfig {
                 File::open(base_dir.join($file))
                     .map_err(|e| format!("Unable to open {}: {:?}", $file, e))
                     .and_then(|file| {
-                        serde_yaml::from_reader(file)
+                        yaml_serde::from_reader(file)
                             .map_err(|e| format!("Unable to parse {}: {:?}", $file, e))
                     })?
             };
@@ -335,12 +376,15 @@ impl Eth2NetworkConfig {
             (None, GenesisStateSource::Unknown)
         };
 
+        let kzg_trusted_setup = get_trusted_setup();
+
         Ok(Self {
             deposit_contract_deploy_block,
             boot_enr,
             genesis_state_source,
             genesis_state_bytes: genesis_state_bytes.map(Into::into),
             config,
+            kzg_trusted_setup,
         })
     }
 }
@@ -352,7 +396,6 @@ async fn download_genesis_state(
     urls: &[&str],
     timeout: Duration,
     checksum: Hash256,
-    log: &Logger,
 ) -> Result<Vec<u8>, String> {
     if urls.is_empty() {
         return Err(
@@ -372,11 +415,10 @@ async fn download_genesis_state(
             .unwrap_or_else(|_| "<REDACTED>".to_string());
 
         info!(
-            log,
-            "Downloading genesis state";
-            "server" => &redacted_url,
-            "timeout" => ?timeout,
-            "info" => "this may take some time on testnets with large validator counts"
+            server = &redacted_url,
+            timeout = ?timeout,
+            info = "this may take some time on testnets with large validator counts",
+            "Downloading genesis state"
         );
 
         let client = Client::new();
@@ -389,10 +431,9 @@ async fn download_genesis_state(
                     return Ok(bytes.into());
                 } else {
                     warn!(
-                        log,
-                        "Genesis state download failed";
-                        "server" => &redacted_url,
-                        "timeout" => ?timeout,
+                        server = &redacted_url,
+                        timeout = ?timeout,
+                        "Genesis state download failed"
                     );
                     errors.push(format!(
                         "Response from {} did not match local checksum",
@@ -433,9 +474,10 @@ fn parse_state_download_url(url: &str) -> Result<Url, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fixed_bytes::FixedBytesExtended;
     use ssz::Encode;
     use tempfile::Builder as TempBuilder;
-    use types::{Config, Eth1Data, GnosisEthSpec, Hash256, MainnetEthSpec};
+    use types::{Eth1Data, GnosisEthSpec, MainnetEthSpec};
 
     type E = MainnetEthSpec;
 
@@ -470,16 +512,9 @@ mod tests {
     async fn mainnet_genesis_state() {
         let config = Eth2NetworkConfig::from_hardcoded_net(&MAINNET).unwrap();
         config
-            .genesis_state::<E>(None, Duration::from_secs(1), &logging::test_logger())
+            .genesis_state::<E>(None, Duration::from_secs(1))
             .await
             .expect("beacon state can decode");
-    }
-
-    #[test]
-    fn prater_and_goerli_are_equal() {
-        let goerli = Eth2NetworkConfig::from_hardcoded_net(&GOERLI).unwrap();
-        let prater = Eth2NetworkConfig::from_hardcoded_net(&PRATER).unwrap();
-        assert_eq!(goerli, prater);
     }
 
     #[test]
@@ -506,6 +541,7 @@ mod tests {
                 urls,
                 checksum,
                 genesis_validators_root,
+                ..
             } = net.genesis_state_source
             {
                 Hash256::from_str(checksum).expect("the checksum must be a valid 32-byte value");
@@ -556,8 +592,10 @@ mod tests {
         } else {
             GenesisStateSource::Unknown
         };
+        // With Deneb enabled by default we must set a trusted setup here.
+        let kzg_trusted_setup = get_trusted_setup();
 
-        let testnet: Eth2NetworkConfig = Eth2NetworkConfig {
+        let testnet = Eth2NetworkConfig {
             deposit_contract_deploy_block,
             boot_enr,
             genesis_state_source,
@@ -566,6 +604,7 @@ mod tests {
                 .map(Encode::as_ssz_bytes)
                 .map(Into::into),
             config,
+            kzg_trusted_setup,
         };
 
         testnet

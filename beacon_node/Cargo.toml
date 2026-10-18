@@ -1,49 +1,46 @@
 [package]
 name = "beacon_node"
-version = "4.5.0"
-authors = [
-    "Paul Hauner <paul@paulhauner.com>",
-    "Age Manning <Age@AgeManning.com",
-]
+version = { workspace = true }
+authors = ["Paul Hauner <paul@paulhauner.com>", "Age Manning <Age@AgeManning.com"]
 edition = { workspace = true }
 
 [lib]
 name = "beacon_node"
 path = "src/lib.rs"
 
-[dev-dependencies]
-node_test_rig = { path = "../testing/node_test_rig" }
-
 [features]
-write_ssz_files = [
-    "beacon_chain/write_ssz_files",
-] # Writes debugging .ssz files to /tmp during block processing.
+# Writes debugging .ssz files to /tmp during block processing.
+write_ssz_files = ["beacon_chain/write_ssz_files"]
+# Enables testing-only CLI flags.
+testing = []
 
 [dependencies]
-eth2_config = { workspace = true }
+account_utils = { workspace = true }
 beacon_chain = { workspace = true }
-types = { workspace = true }
-store = { workspace = true }
-client = { path = "client" }
+bls = { workspace = true }
 clap = { workspace = true }
-slog = { workspace = true }
-dirs = { workspace = true }
-directory = { workspace = true }
-futures = { workspace = true }
-environment = { workspace = true }
-task_executor = { workspace = true }
-genesis = { workspace = true }
-eth2_network_config = { workspace = true }
-execution_layer = { workspace = true }
-lighthouse_network = { workspace = true }
-serde = { workspace = true }
 clap_utils = { workspace = true }
-hyper = { workspace = true }
-lighthouse_version = { workspace = true }
+client = { path = "client" }
+directory = { workspace = true }
+dirs = { workspace = true }
+environment = { workspace = true }
+eth2_config = { workspace = true }
+execution_layer = { workspace = true }
+genesis = { workspace = true }
 hex = { workspace = true }
-slasher = { workspace = true }
-monitoring_api = { workspace = true }
-sensitive_url = { workspace = true }
 http_api = { workspace = true }
-unused_port = { workspace = true }
+hyper = { workspace = true }
+lighthouse_network = { workspace = true }
+monitoring_api = { workspace = true }
+network_utils = { workspace = true }
+sensitive_url = { workspace = true }
+serde_json = { workspace = true }
+slasher = { workspace = true }
+store = { workspace = true }
 strum = { workspace = true }
+task_executor = { workspace = true }
+tracing = { workspace = true }
+types = { workspace = true }
+
+[dev-dependencies]
+node_test_rig = { path = "../testing/node_test_rig" }

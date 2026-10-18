@@ -1,26 +1,35 @@
-use crate::graffiti_file::GraffitiFile;
-use crate::{http_api, http_metrics};
+use crate::cli::ValidatorClient;
+use beacon_node_fallback::ApiTopic;
+use beacon_node_fallback::beacon_node_health::BeaconNodeSyncDistanceTiers;
 use clap::ArgMatches;
-use clap_utils::{flags::DISABLE_MALLOC_TUNING_FLAG, parse_optional, parse_required};
+use clap_utils::{flags::DISABLE_MALLOC_TUNING_FLAG, parse_required};
 use directory::{
-    get_network_dir, DEFAULT_HARDCODED_NETWORK, DEFAULT_ROOT_DIR, DEFAULT_SECRET_DIR,
-    DEFAULT_VALIDATOR_DIR,
+    DEFAULT_HARDCODED_NETWORK, DEFAULT_ROOT_DIR, DEFAULT_SECRET_DIR, DEFAULT_VALIDATOR_DIR,
+    get_network_dir,
 };
-use eth2::types::Graffiti;
+use eth2::types::{Graffiti, GraffitiPolicy};
+use graffiti_file::GraffitiFile;
+use initialized_validators::Config as InitializedValidatorsConfig;
+use lighthouse_validator_store::Config as ValidatorStoreConfig;
 use sensitive_url::SensitiveUrl;
-use serde_derive::{Deserialize, Serialize};
-use slog::{info, warn, Logger};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use types::{Address, GRAFFITI_BYTES_LEN};
+use tracing::{info, warn};
+use types::GRAFFITI_BYTES_LEN;
+use validator_http_api::{self, PK_FILENAME};
+use validator_http_metrics;
 
 pub const DEFAULT_BEACON_NODE: &str = "http://localhost:5052/";
 
 /// Stores the core configuration for this validator instance.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
+    /// Configuration parameters for the validator store.
+    #[serde(flatten)]
+    pub validator_store: ValidatorStoreConfig,
     /// The data directory, which stores all validator databases
     pub validator_dir: PathBuf,
     /// The directory containing the passwords to unlock validator keystores.
@@ -40,16 +49,20 @@ pub struct Config {
     pub init_slashing_protection: bool,
     /// If true, use longer timeouts for requests made to the beacon node.
     pub use_long_timeouts: bool,
+    /// Multiplier to use for long timeouts.
+    pub long_timeouts_multiplier: u32,
     /// Graffiti to be inserted everytime we create a block.
     pub graffiti: Option<Graffiti>,
     /// Graffiti file to load per validator graffitis.
     pub graffiti_file: Option<GraffitiFile>,
-    /// Fallback fallback address.
-    pub fee_recipient: Option<Address>,
+    /// GraffitiPolicy to append client version info
+    pub graffiti_policy: Option<GraffitiPolicy>,
     /// Configuration for the HTTP REST API.
-    pub http_api: http_api::Config,
+    pub http_api: validator_http_api::Config,
     /// Configuration for the HTTP REST API.
-    pub http_metrics: http_metrics::Config,
+    pub http_metrics: validator_http_metrics::Config,
+    /// Configuration for the Beacon Node fallback.
+    pub beacon_node_fallback: beacon_node_fallback::Config,
     /// Configuration for sending metrics to a remote explorer endpoint.
     pub monitoring_api: Option<monitoring_api::Config>,
     /// If true, enable functionality that monitors the network for attestations or proposals from
@@ -61,24 +74,26 @@ pub struct Config {
     /// (<= 64 validators)
     pub enable_high_validator_count_metrics: bool,
     /// Enable use of the blinded block endpoints during proposals.
-    pub builder_proposals: bool,
-    /// Overrides the timestamp field in builder api ValidatorRegistrationV1
     pub builder_registration_timestamp_override: Option<u64>,
-    /// Fallback gas limit.
-    pub gas_limit: Option<u64>,
     /// A list of custom certificates that the validator client will additionally use when
     /// connecting to a beacon node over SSL/TLS.
     pub beacon_nodes_tls_certs: Option<Vec<PathBuf>>,
-    /// Delay from the start of the slot to wait before publishing a block.
-    ///
-    /// This is *not* recommended in prod and should only be used for testing.
-    pub block_delay: Option<Duration>,
-    /// Disables publishing http api requests to all beacon nodes for select api calls.
-    pub disable_run_on_all: bool,
+    /// Enables broadcasting of various requests (by topic) to all beacon nodes.
+    pub broadcast_topics: Vec<ApiTopic>,
     /// Enables a service which attempts to measure latency between the VC and BNs.
     pub enable_latency_measurement_service: bool,
+    /// Enables the beacon head monitor that reacts to head updates from connected beacon nodes.
+    pub enable_beacon_head_monitor: bool,
     /// Defines the number of validators per `validator/register_validator` request sent to the BN.
     pub validator_registration_batch_size: usize,
+    /// Whether we are running with distributed network support.
+    pub distributed: bool,
+    /// Configuration for the initialized validators
+    #[serde(flatten)]
+    pub initialized_validators: InitializedValidatorsConfig,
+    pub disable_attesting: bool,
+    /// Fetch proposer duties using the v1 endpoint instead of v2.
+    pub disable_proposer_duties_v2: bool,
 }
 
 impl Default for Config {
@@ -93,9 +108,12 @@ impl Default for Config {
         let validator_dir = base_dir.join(DEFAULT_VALIDATOR_DIR);
         let secrets_dir = base_dir.join(DEFAULT_SECRET_DIR);
 
-        let beacon_nodes = vec![SensitiveUrl::parse(DEFAULT_BEACON_NODE)
-            .expect("beacon_nodes must always be a valid url.")];
+        let beacon_nodes = vec![
+            SensitiveUrl::parse(DEFAULT_BEACON_NODE)
+                .expect("beacon_nodes must always be a valid url."),
+        ];
         Self {
+            validator_store: ValidatorStoreConfig::default(),
             validator_dir,
             secrets_dir,
             beacon_nodes,
@@ -104,22 +122,26 @@ impl Default for Config {
             disable_auto_discover: false,
             init_slashing_protection: false,
             use_long_timeouts: false,
+            long_timeouts_multiplier: 1,
             graffiti: None,
             graffiti_file: None,
-            fee_recipient: None,
+            graffiti_policy: None,
             http_api: <_>::default(),
             http_metrics: <_>::default(),
+            beacon_node_fallback: <_>::default(),
             monitoring_api: None,
             enable_doppelganger_protection: false,
             enable_high_validator_count_metrics: false,
             beacon_nodes_tls_certs: None,
-            block_delay: None,
-            builder_proposals: false,
             builder_registration_timestamp_override: None,
-            gas_limit: None,
-            disable_run_on_all: false,
+            broadcast_topics: vec![ApiTopic::Subscriptions],
             enable_latency_measurement_service: true,
+            enable_beacon_head_monitor: true,
             validator_registration_batch_size: 500,
+            distributed: false,
+            initialized_validators: <_>::default(),
+            disable_attesting: false,
+            disable_proposer_duties_v2: false,
         }
     }
 }
@@ -127,7 +149,10 @@ impl Default for Config {
 impl Config {
     /// Returns a `Default` implementation of `Self` with some parameters modified by the supplied
     /// `cli_args`.
-    pub fn from_cli(cli_args: &ArgMatches, log: &Logger) -> Result<Config, String> {
+    pub fn from_cli(
+        cli_args: &ArgMatches,
+        validator_client_config: &ValidatorClient,
+    ) -> Result<Config, String> {
         let mut config = Config::default();
 
         let default_root_dir = dirs::home_dir()
@@ -135,16 +160,17 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."));
 
         let (mut validator_dir, mut secrets_dir) = (None, None);
-        if cli_args.value_of("datadir").is_some() {
+        if cli_args.get_one::<String>("datadir").is_some() {
             let base_dir: PathBuf = parse_required(cli_args, "datadir")?;
             validator_dir = Some(base_dir.join(DEFAULT_VALIDATOR_DIR));
             secrets_dir = Some(base_dir.join(DEFAULT_SECRET_DIR));
         }
-        if cli_args.value_of("validators-dir").is_some() {
-            validator_dir = Some(parse_required(cli_args, "validators-dir")?);
+
+        if let Some(validator_dir_path) = validator_client_config.validators_dir.as_ref() {
+            validator_dir = Some(validator_dir_path.clone());
         }
-        if cli_args.value_of("secrets-dir").is_some() {
-            secrets_dir = Some(parse_required(cli_args, "secrets-dir")?);
+        if let Some(secrets_dir_path) = validator_client_config.secrets_dir.as_ref() {
+            secrets_dir = Some(secrets_dir_path.clone());
         }
 
         config.validator_dir = validator_dir.unwrap_or_else(|| {
@@ -164,72 +190,40 @@ impl Config {
                 .map_err(|e| format!("Failed to create {:?}: {:?}", config.validator_dir, e))?;
         }
 
-        if let Some(beacon_nodes) = parse_optional::<String>(cli_args, "beacon-nodes")? {
+        if let Some(beacon_nodes) = validator_client_config.beacon_nodes.as_ref() {
             config.beacon_nodes = beacon_nodes
-                .split(',')
-                .map(SensitiveUrl::parse)
+                .iter()
+                .map(|s| SensitiveUrl::parse(s))
                 .collect::<Result<_, _>>()
                 .map_err(|e| format!("Unable to parse beacon node URL: {:?}", e))?;
         }
-        // To be deprecated.
-        else if let Some(beacon_node) = parse_optional::<String>(cli_args, "beacon-node")? {
-            warn!(
-                log,
-                "The --beacon-node flag is deprecated";
-                "msg" => "please use --beacon-nodes instead"
-            );
-            config.beacon_nodes = vec![SensitiveUrl::parse(&beacon_node)
-                .map_err(|e| format!("Unable to parse beacon node URL: {:?}", e))?];
-        }
-        // To be deprecated.
-        else if let Some(server) = parse_optional::<String>(cli_args, "server")? {
-            warn!(
-                log,
-                "The --server flag is deprecated";
-                "msg" => "please use --beacon-nodes instead"
-            );
-            config.beacon_nodes = vec![SensitiveUrl::parse(&server)
-                .map_err(|e| format!("Unable to parse beacon node URL: {:?}", e))?];
-        }
 
-        if let Some(proposer_nodes) = parse_optional::<String>(cli_args, "proposer_nodes")? {
+        if let Some(proposer_nodes) = validator_client_config.proposer_nodes.as_ref() {
             config.proposer_nodes = proposer_nodes
-                .split(',')
-                .map(SensitiveUrl::parse)
+                .iter()
+                .map(|s| SensitiveUrl::parse(s))
                 .collect::<Result<_, _>>()
                 .map_err(|e| format!("Unable to parse proposer node URL: {:?}", e))?;
         }
 
-        if cli_args.is_present("delete-lockfiles") {
-            warn!(
-                log,
-                "The --delete-lockfiles flag is deprecated";
-                "msg" => "it is no longer necessary, and no longer has any effect",
-            );
-        }
+        config.disable_auto_discover = validator_client_config.disable_auto_discover;
+        config.init_slashing_protection = validator_client_config.init_slashing_protection;
+        config.use_long_timeouts = validator_client_config.use_long_timeouts;
+        config.long_timeouts_multiplier = validator_client_config.long_timeouts_multiplier;
 
-        if cli_args.is_present("allow-unsynced") {
-            warn!(
-                log,
-                "The --allow-unsynced flag is deprecated";
-                "msg" => "it no longer has any effect",
-            );
-        }
-        config.disable_run_on_all = cli_args.is_present("disable-run-on-all");
-        config.disable_auto_discover = cli_args.is_present("disable-auto-discover");
-        config.init_slashing_protection = cli_args.is_present("init-slashing-protection");
-        config.use_long_timeouts = cli_args.is_present("use-long-timeouts");
-
-        if let Some(graffiti_file_path) = cli_args.value_of("graffiti-file") {
+        if let Some(graffiti_file_path) = validator_client_config.graffiti_file.as_ref() {
             let mut graffiti_file = GraffitiFile::new(graffiti_file_path.into());
             graffiti_file
                 .read_graffiti_file()
                 .map_err(|e| format!("Error reading graffiti file: {:?}", e))?;
             config.graffiti_file = Some(graffiti_file);
-            info!(log, "Successfully loaded graffiti file"; "path" => graffiti_file_path);
+            info!(
+                path = graffiti_file_path.to_str(),
+                "Successfully loaded graffiti file"
+            );
         }
 
-        if let Some(input_graffiti) = cli_args.value_of("graffiti") {
+        if let Some(input_graffiti) = validator_client_config.graffiti.as_ref() {
             let graffiti_bytes = input_graffiti.as_bytes();
             if graffiti_bytes.len() > GRAFFITI_BYTES_LEN {
                 return Err(format!(
@@ -248,26 +242,59 @@ impl Config {
             }
         }
 
-        if let Some(input_fee_recipient) =
-            parse_optional::<Address>(cli_args, "suggested-fee-recipient")?
-        {
-            config.fee_recipient = Some(input_fee_recipient);
+        config.graffiti_policy = if validator_client_config.graffiti_append.unwrap_or(true) {
+            Some(GraffitiPolicy::AppendClientVersions)
+        } else {
+            Some(GraffitiPolicy::PreserveUserGraffiti)
+        };
+
+        if let Some(input_fee_recipient) = validator_client_config.suggested_fee_recipient {
+            config.validator_store.fee_recipient = Some(input_fee_recipient);
         }
 
-        if let Some(tls_certs) = parse_optional::<String>(cli_args, "beacon-nodes-tls-certs")? {
-            config.beacon_nodes_tls_certs = Some(tls_certs.split(',').map(PathBuf::from).collect());
+        if let Some(tls_certs) = validator_client_config.beacon_nodes_tls_certs.as_ref() {
+            config.beacon_nodes_tls_certs = Some(tls_certs.iter().map(PathBuf::from).collect());
+        }
+
+        config.distributed = validator_client_config.distributed;
+
+        if let Some(mut broadcast_topics) = validator_client_config.broadcast.clone() {
+            broadcast_topics.retain(|topic| *topic != ApiTopic::None);
+            config.broadcast_topics = broadcast_topics;
+        }
+
+        /*
+         * Beacon node fallback
+         */
+        config.beacon_node_fallback.sync_tolerances = BeaconNodeSyncDistanceTiers::from_vec(
+            &validator_client_config.beacon_nodes_sync_tolerances,
+        )?;
+
+        /*
+         * Web3 signer
+         */
+        if validator_client_config.web3_signer_keep_alive_timeout == 0 {
+            config.initialized_validators.web3_signer_keep_alive_timeout = None
+        } else {
+            config.initialized_validators.web3_signer_keep_alive_timeout = Some(
+                Duration::from_millis(validator_client_config.web3_signer_keep_alive_timeout),
+            );
+        }
+
+        if let Some(n) = validator_client_config.web3_signer_max_idle_connections {
+            config
+                .initialized_validators
+                .web3_signer_max_idle_connections = Some(n);
         }
 
         /*
          * Http API server
          */
 
-        if cli_args.is_present("http") {
-            config.http_api.enabled = true;
-        }
+        config.http_api.enabled = validator_client_config.http;
 
-        if let Some(address) = cli_args.value_of("http-address") {
-            if cli_args.is_present("unencrypted-http-transport") {
+        if let Some(address) = &validator_client_config.http_address {
+            if validator_client_config.unencrypted_http_transport {
                 config.http_api.listen_addr = address
                     .parse::<IpAddr>()
                     .map_err(|_| "http-address is not a valid IP address.")?;
@@ -279,13 +306,9 @@ impl Config {
             }
         }
 
-        if let Some(port) = cli_args.value_of("http-port") {
-            config.http_api.listen_port = port
-                .parse::<u16>()
-                .map_err(|_| "http-port is not a valid u16.")?;
-        }
+        config.http_api.listen_port = validator_client_config.http_port;
 
-        if let Some(allow_origin) = cli_args.value_of("http-allow-origin") {
+        if let Some(allow_origin) = validator_client_config.http_allow_origin.as_ref() {
             // Pre-validate the config value to give feedback to the user on node startup, instead of
             // as late as when the first API response is produced.
             hyper::header::HeaderValue::from_str(allow_origin)
@@ -294,39 +317,34 @@ impl Config {
             config.http_api.allow_origin = Some(allow_origin.to_string());
         }
 
-        if cli_args.is_present("http-allow-keystore-export") {
-            config.http_api.allow_keystore_export = true;
-        }
+        config.http_api.allow_keystore_export = validator_client_config.http_allow_keystore_export;
+        config.http_api.store_passwords_in_secrets_dir =
+            validator_client_config.http_store_passwords_in_secrets_dir;
 
-        if cli_args.is_present("http-store-passwords-in-secrets-dir") {
-            config.http_api.store_passwords_in_secrets_dir = true;
+        if let Some(http_token_path) = &validator_client_config.http_token_path {
+            config.http_api.http_token_path = PathBuf::from(http_token_path);
+        } else {
+            // For backward compatibility, default to the path under the validator dir if not provided.
+            config.http_api.http_token_path = config.validator_dir.join(PK_FILENAME);
         }
 
         /*
          * Prometheus metrics HTTP server
          */
 
-        if cli_args.is_present("metrics") {
-            config.http_metrics.enabled = true;
-        }
+        config.http_metrics.enabled = validator_client_config.metrics;
+        config.enable_high_validator_count_metrics =
+            validator_client_config.enable_high_validator_count_metrics;
 
-        if cli_args.is_present("enable-high-validator-count-metrics") {
-            config.enable_high_validator_count_metrics = true;
-        }
-
-        if let Some(address) = cli_args.value_of("metrics-address") {
-            config.http_metrics.listen_addr = address
+        if let Some(metrics_address) = &validator_client_config.metrics_address {
+            config.http_metrics.listen_addr = metrics_address
                 .parse::<IpAddr>()
                 .map_err(|_| "metrics-address is not a valid IP address.")?;
         }
 
-        if let Some(port) = cli_args.value_of("metrics-port") {
-            config.http_metrics.listen_port = port
-                .parse::<u16>()
-                .map_err(|_| "metrics-port is not a valid u16.")?;
-        }
+        config.http_metrics.listen_port = validator_client_config.metrics_port;
 
-        if let Some(allow_origin) = cli_args.value_of("metrics-allow-origin") {
+        if let Some(allow_origin) = validator_client_config.metrics_allow_origin.as_ref() {
             // Pre-validate the config value to give feedback to the user on node startup, instead of
             // as late as when the first API response is produced.
             hyper::header::HeaderValue::from_str(allow_origin)
@@ -335,16 +353,15 @@ impl Config {
             config.http_metrics.allow_origin = Some(allow_origin.to_string());
         }
 
-        if cli_args.is_present(DISABLE_MALLOC_TUNING_FLAG) {
+        if cli_args.get_flag(DISABLE_MALLOC_TUNING_FLAG) {
             config.http_metrics.allocator_metrics_enabled = false;
         }
 
         /*
          * Explorer metrics
          */
-        if let Some(monitoring_endpoint) = cli_args.value_of("monitoring-endpoint") {
-            let update_period_secs =
-                clap_utils::parse_optional(cli_args, "monitoring-endpoint-period")?;
+        if let Some(monitoring_endpoint) = validator_client_config.monitoring_endpoint.as_ref() {
+            let update_period_secs = Some(validator_client_config.monitoring_endpoint_period);
             config.monitoring_api = Some(monitoring_api::Config {
                 db_path: None,
                 freezer_db_path: None,
@@ -353,56 +370,42 @@ impl Config {
             });
         }
 
-        if cli_args.is_present("enable-doppelganger-protection") {
-            config.enable_doppelganger_protection = true;
-        }
+        config.enable_doppelganger_protection =
+            validator_client_config.enable_doppelganger_protection;
+        config.validator_store.builder_proposals = validator_client_config.builder_proposals;
+        config.validator_store.prefer_builder_proposals =
+            validator_client_config.prefer_builder_proposals;
+        config.validator_store.gas_limit = Some(validator_client_config.gas_limit);
 
-        if cli_args.is_present("builder-proposals") {
-            config.builder_proposals = true;
-        }
+        config.builder_registration_timestamp_override =
+            validator_client_config.builder_registration_timestamp_override;
 
-        config.gas_limit = cli_args
-            .value_of("gas-limit")
-            .map(|gas_limit| {
-                gas_limit
-                    .parse::<u64>()
-                    .map_err(|_| "gas-limit is not a valid u64.")
-            })
-            .transpose()?;
-
-        if let Some(registration_timestamp_override) =
-            cli_args.value_of("builder-registration-timestamp-override")
-        {
-            config.builder_registration_timestamp_override = Some(
-                registration_timestamp_override
-                    .parse::<u64>()
-                    .map_err(|_| "builder-registration-timestamp-override is not a valid u64.")?,
-            );
-        }
-
-        if cli_args.is_present("strict-fee-recipient") {
-            warn!(
-                log,
-                "The flag `--strict-fee-recipient` has been deprecated due to a bug causing \
-                missed proposals. The flag will be ignored."
-            );
-        }
-
+        config.validator_store.builder_boost_factor = validator_client_config.builder_boost_factor;
         config.enable_latency_measurement_service =
-            parse_optional(cli_args, "latency-measurement-service")?.unwrap_or(true);
+            !validator_client_config.disable_latency_measurement_service;
+        config.enable_beacon_head_monitor = !validator_client_config.disable_beacon_head_monitor;
 
         config.validator_registration_batch_size =
-            parse_required(cli_args, "validator-registration-batch-size")?;
+            validator_client_config.validator_registration_batch_size;
+
         if config.validator_registration_batch_size == 0 {
             return Err("validator-registration-batch-size cannot be 0".to_string());
         }
 
-        /*
-         * Experimental
-         */
-        if let Some(delay_ms) = parse_optional::<u64>(cli_args, "block-delay-ms")? {
-            config.block_delay = Some(Duration::from_millis(delay_ms));
-        }
+        config.validator_store.enable_web3signer_slashing_protection =
+            if validator_client_config.disable_slashing_protection_web3signer {
+                warn!(
+                    info = "ensure slashing protection on web3signer is enabled or you WILL \
+                               get slashed",
+                    "Slashing protection for remote keys disabled"
+                );
+                false
+            } else {
+                true
+            };
+
+        config.disable_attesting = validator_client_config.disable_attesting;
+        config.disable_proposer_duties_v2 = validator_client_config.disable_proposer_duties_v2;
 
         Ok(config)
     }

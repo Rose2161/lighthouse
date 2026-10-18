@@ -1,8 +1,6 @@
 use super::signature_sets::Error as SignatureSetError;
-use crate::per_epoch_processing::altair::participation_cache;
 use crate::ContextError;
 use merkle_proof::MerkleTreeError;
-use participation_cache::Error as ParticipationCacheError;
 use safe_arith::ArithError;
 use ssz::DecodeError;
 use types::*;
@@ -43,6 +41,10 @@ pub enum BlockProcessingError {
         index: usize,
         reason: AttestationInvalid,
     },
+    PayloadAttestationInvalid {
+        index: usize,
+        reason: PayloadAttestationInvalid,
+    },
     DepositInvalid {
         index: usize,
         reason: DepositInvalid,
@@ -62,6 +64,7 @@ pub enum BlockProcessingError {
     SignatureSetError(SignatureSetError),
     SszTypesError(ssz_types::Error),
     SszDecodeError(DecodeError),
+    BitfieldError(ssz::BitfieldError),
     MerkleTreeError(MerkleTreeError),
     ArithError(ArithError),
     InconsistentBlockFork(InconsistentFork),
@@ -78,14 +81,40 @@ pub enum BlockProcessingError {
         expected: u64,
         found: u64,
     },
+    ExecutionInvalidBlobsLen {
+        max: usize,
+        actual: usize,
+    },
     ExecutionInvalid,
     ConsensusContext(ContextError),
+    MilhouseError(milhouse::Error),
+    EpochCacheError(EpochCacheError),
     WithdrawalsRootMismatch {
         expected: Hash256,
         found: Hash256,
     },
     WithdrawalCredentialsInvalid,
-    ParticipationCacheError(ParticipationCacheError),
+    /// This should be unreachable unless there's a logical flaw in the spec for withdrawals.
+    WithdrawalsLimitExceeded {
+        limit: usize,
+        prior_withdrawals: usize,
+    },
+    /// Unreachable unless there's a logic error in LH.
+    IncorrectExpectedWithdrawalsVariant,
+    MissingLastWithdrawal,
+    PendingAttestationInElectra,
+    ExecutionPayloadBidInvalid {
+        reason: ExecutionPayloadBidInvalid,
+    },
+    /// Builder payment index out of bounds (Gloas)
+    BuilderPaymentIndexOutOfBounds(usize),
+    /// The parent execution requests root doesn't match the committed bid
+    ExecutionRequestsRootMismatch {
+        expected: Hash256,
+        found: Hash256,
+    },
+    /// Parent was not full but non-empty execution requests were provided
+    NonEmptyParentExecutionRequests,
 }
 
 impl From<BeaconStateError> for BlockProcessingError {
@@ -130,6 +159,24 @@ impl From<ContextError> for BlockProcessingError {
     }
 }
 
+impl From<EpochCacheError> for BlockProcessingError {
+    fn from(e: EpochCacheError) -> Self {
+        BlockProcessingError::EpochCacheError(e)
+    }
+}
+
+impl From<milhouse::Error> for BlockProcessingError {
+    fn from(e: milhouse::Error) -> Self {
+        Self::MilhouseError(e)
+    }
+}
+
+impl From<ExecutionPayloadBidInvalid> for BlockProcessingError {
+    fn from(reason: ExecutionPayloadBidInvalid) -> Self {
+        Self::ExecutionPayloadBidInvalid { reason }
+    }
+}
+
 impl From<BlockOperationError<HeaderInvalid>> for BlockProcessingError {
     fn from(e: BlockOperationError<HeaderInvalid>) -> BlockProcessingError {
         match e {
@@ -137,15 +184,10 @@ impl From<BlockOperationError<HeaderInvalid>> for BlockProcessingError {
             BlockOperationError::BeaconStateError(e) => BlockProcessingError::BeaconStateError(e),
             BlockOperationError::SignatureSetError(e) => BlockProcessingError::SignatureSetError(e),
             BlockOperationError::SszTypesError(e) => BlockProcessingError::SszTypesError(e),
+            BlockOperationError::BitfieldError(e) => BlockProcessingError::BitfieldError(e),
             BlockOperationError::ConsensusContext(e) => BlockProcessingError::ConsensusContext(e),
             BlockOperationError::ArithError(e) => BlockProcessingError::ArithError(e),
         }
-    }
-}
-
-impl From<ParticipationCacheError> for BlockProcessingError {
-    fn from(e: ParticipationCacheError) -> Self {
-        BlockProcessingError::ParticipationCacheError(e)
     }
 }
 
@@ -171,6 +213,7 @@ macro_rules! impl_into_block_processing_error_with_index {
                         BlockOperationError::BeaconStateError(e) => BlockProcessingError::BeaconStateError(e),
                         BlockOperationError::SignatureSetError(e) => BlockProcessingError::SignatureSetError(e),
                         BlockOperationError::SszTypesError(e) => BlockProcessingError::SszTypesError(e),
+                        BlockOperationError::BitfieldError(e) => BlockProcessingError::BitfieldError(e),
                         BlockOperationError::ConsensusContext(e) => BlockProcessingError::ConsensusContext(e),
                         BlockOperationError::ArithError(e) => BlockProcessingError::ArithError(e),
                     }
@@ -185,6 +228,7 @@ impl_into_block_processing_error_with_index!(
     AttesterSlashingInvalid,
     IndexedAttestationInvalid,
     AttestationInvalid,
+    PayloadAttestationInvalid,
     DepositInvalid,
     ExitInvalid,
     BlsExecutionChangeInvalid
@@ -205,6 +249,7 @@ pub enum BlockOperationError<T> {
     BeaconStateError(BeaconStateError),
     SignatureSetError(SignatureSetError),
     SszTypesError(ssz_types::Error),
+    BitfieldError(ssz::BitfieldError),
     ConsensusContext(ContextError),
     ArithError(ArithError),
 }
@@ -229,6 +274,12 @@ impl<T> From<SignatureSetError> for BlockOperationError<T> {
 impl<T> From<ssz_types::Error> for BlockOperationError<T> {
     fn from(error: ssz_types::Error) -> Self {
         BlockOperationError::SszTypesError(error)
+    }
+}
+
+impl<T> From<ssz::BitfieldError> for BlockOperationError<T> {
+    fn from(error: ssz::BitfieldError) -> Self {
+        BlockOperationError::BitfieldError(error)
     }
 }
 
@@ -324,9 +375,11 @@ pub enum AttestationInvalid {
     ///
     /// `is_current` is `true` if the attestation was compared to the
     /// `state.current_justified_checkpoint`, `false` if compared to `state.previous_justified_checkpoint`.
+    ///
+    /// Checkpoints have been boxed to keep the error size down and prevent clippy failures.
     WrongJustifiedCheckpoint {
-        state: Checkpoint,
-        attestation: Checkpoint,
+        state: Box<Checkpoint>,
+        attestation: Box<Checkpoint>,
         is_current: bool,
     },
     /// The aggregation bitfield length is not the smallest possible size to represent the committee.
@@ -342,6 +395,8 @@ pub enum AttestationInvalid {
     BadSignature,
     /// The indexed attestation created from this attestation was found to be invalid.
     BadIndexedAttestation(IndexedAttestationInvalid),
+    /// The overloaded "data.index" field is invalid (post-Gloas).
+    BadOverloadedDataIndex,
 }
 
 impl From<BlockOperationError<IndexedAttestationInvalid>>
@@ -355,6 +410,7 @@ impl From<BlockOperationError<IndexedAttestationInvalid>>
             BlockOperationError::BeaconStateError(e) => BlockOperationError::BeaconStateError(e),
             BlockOperationError::SignatureSetError(e) => BlockOperationError::SignatureSetError(e),
             BlockOperationError::SszTypesError(e) => BlockOperationError::SszTypesError(e),
+            BlockOperationError::BitfieldError(e) => BlockOperationError::BitfieldError(e),
             BlockOperationError::ConsensusContext(e) => BlockOperationError::ConsensusContext(e),
             BlockOperationError::ArithError(e) => BlockOperationError::ArithError(e),
         }
@@ -371,6 +427,52 @@ pub enum IndexedAttestationInvalid {
     BadValidatorIndicesOrdering(usize),
     /// The validator index is unknown. One cannot slash one who does not exist.
     UnknownValidator(u64),
+    /// The indexed attestation aggregate signature was not valid.
+    BadSignature,
+    /// There was an error whilst attempting to get a set of signatures. The signatures may have
+    /// been invalid or an internal error occurred.
+    SignatureSetError(SignatureSetError),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum PayloadAttestationInvalid {
+    /// Block root does not match the parent beacon block root.
+    BlockRootMismatch {
+        expected: Hash256,
+        found: Hash256,
+    },
+    /// The attestation slot is not the previous slot.
+    SlotMismatch {
+        expected: Slot,
+        found: Slot,
+    },
+    BadIndexedPayloadAttestation(IndexedPayloadAttestationInvalid),
+}
+
+impl From<BlockOperationError<IndexedPayloadAttestationInvalid>>
+    for BlockOperationError<PayloadAttestationInvalid>
+{
+    fn from(e: BlockOperationError<IndexedPayloadAttestationInvalid>) -> Self {
+        match e {
+            BlockOperationError::Invalid(e) => BlockOperationError::invalid(
+                PayloadAttestationInvalid::BadIndexedPayloadAttestation(e),
+            ),
+            BlockOperationError::BeaconStateError(e) => BlockOperationError::BeaconStateError(e),
+            BlockOperationError::SignatureSetError(e) => BlockOperationError::SignatureSetError(e),
+            BlockOperationError::SszTypesError(e) => BlockOperationError::SszTypesError(e),
+            BlockOperationError::BitfieldError(e) => BlockOperationError::BitfieldError(e),
+            BlockOperationError::ConsensusContext(e) => BlockOperationError::ConsensusContext(e),
+            BlockOperationError::ArithError(e) => BlockOperationError::ArithError(e),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum IndexedPayloadAttestationInvalid {
+    /// The number of indices is 0.
+    IndicesEmpty,
+    /// The validator indices were not in increasing order.
+    BadValidatorIndicesOrdering,
     /// The indexed attestation aggregate signature was not valid.
     BadSignature,
     /// There was an error whilst attempting to get a set of signatures. The signatures may have
@@ -400,7 +502,10 @@ pub enum ExitInvalid {
     /// The specified validator has already initiated exit.
     AlreadyInitiatedExit(u64),
     /// The exit is for a future epoch.
-    FutureEpoch { state: Epoch, exit: Epoch },
+    FutureEpoch {
+        state: Epoch,
+        exit: Epoch,
+    },
     /// The validator has not been active for long enough.
     TooYoungToExit {
         current_epoch: Epoch,
@@ -411,6 +516,39 @@ pub enum ExitInvalid {
     /// There was an error whilst attempting to get a set of signatures. The signatures may have
     /// been invalid or an internal error occurred.
     SignatureSetError(SignatureSetError),
+    PendingWithdrawalInQueue(u64),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum ExecutionPayloadBidInvalid {
+    /// The validator set a non-zero amount for a self-build.
+    SelfBuildNonZeroAmount,
+    /// The signature is invalid.
+    BadSignature,
+    /// The builder is not active.
+    BuilderNotActive(u64),
+    /// The builder has insufficient balance to cover the bid
+    InsufficientBalance {
+        builder_index: u64,
+        builder_balance: u64,
+        bid_value: u64,
+    },
+    /// Bid slot doesn't match block slot
+    SlotMismatch { bid_slot: Slot, block_slot: Slot },
+    /// The bid's parent block hash doesn't match the state's latest block hash
+    ParentBlockHashMismatch {
+        state_block_hash: ExecutionBlockHash,
+        bid_parent_hash: ExecutionBlockHash,
+    },
+    /// The bid's parent block root doesn't match the block's parent root
+    ParentBlockRootMismatch {
+        block_parent_root: Hash256,
+        bid_parent_root: Hash256,
+    },
+    /// The bid's prev randao doesn't match the state.
+    PrevRandaoMismatch { expected: Hash256, bid: Hash256 },
+    /// The bid contains more than the maximum number of kzg blob commitments.
+    ExcessBlobCommitments { max: usize, bid: usize },
 }
 
 #[derive(Debug, PartialEq, Clone)]

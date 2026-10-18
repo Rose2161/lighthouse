@@ -1,27 +1,41 @@
 use super::common::*;
 use crate::DumpConfig;
-use clap::{App, Arg, ArgMatches};
-use eth2::{lighthouse_vc::std_types::ImportKeystoreStatus, SensitiveUrl};
+use account_utils::eth2_keystore::Keystore;
+use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap_utils::FLAG_HEADER;
+use educe::Educe;
+use eth2::lighthouse_vc::types::KeystoreJsonStr;
+use eth2::{SensitiveUrl, lighthouse_vc::std_types::ImportKeystoreStatus};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use types::Address;
+use zeroize::Zeroizing;
 
 pub const CMD: &str = "import";
 pub const VALIDATORS_FILE_FLAG: &str = "validators-file";
+pub const KEYSTORE_FILE_FLAG: &str = "keystore-file";
 pub const VC_URL_FLAG: &str = "vc-url";
 pub const VC_TOKEN_FLAG: &str = "vc-token";
+pub const PASSWORD: &str = "password";
+pub const FEE_RECIPIENT: &str = "suggested-fee-recipient";
+pub const GAS_LIMIT: &str = "gas-limit";
+pub const BUILDER_PROPOSALS: &str = "builder-proposals";
+pub const BUILDER_BOOST_FACTOR: &str = "builder-boost-factor";
+pub const PREFER_BUILDER_PROPOSALS: &str = "prefer-builder-proposals";
+pub const ENABLED: &str = "enabled";
 
 pub const DETECTED_DUPLICATE_MESSAGE: &str = "Duplicate validator detected!";
 
-pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
-    App::new(CMD)
+pub fn cli_app() -> Command {
+    Command::new(CMD)
         .about(
             "Uploads validators to a validator client using the HTTP API. The validators \
                 are defined in a JSON file which can be generated using the \"create-validators\" \
                 command.",
         )
         .arg(
-            Arg::with_name(VALIDATORS_FILE_FLAG)
+            Arg::new(VALIDATORS_FILE_FLAG)
                 .long(VALIDATORS_FILE_FLAG)
                 .value_name("PATH_TO_JSON_FILE")
                 .help(
@@ -29,32 +43,49 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                     imported to the validator client. This file is usually named \
                     \"validators.json\".",
                 )
-                .required(true)
-                .takes_value(true),
+                .action(ArgAction::Set)
+                .display_order(0)
+                .required_unless_present("keystore-file")
+                .conflicts_with("keystore-file"),
         )
         .arg(
-            Arg::with_name(VC_URL_FLAG)
+            Arg::new(KEYSTORE_FILE_FLAG)
+                .long(KEYSTORE_FILE_FLAG)
+                .value_name("PATH_TO_KEYSTORE_FILE")
+                .help(
+                    "The path to a keystore JSON file to be \
+                    imported to the validator client. This file is usually created \
+                    using ethstaker-deposit-cli",
+                )
+                .action(ArgAction::Set)
+                .display_order(0)
+                .conflicts_with("validators-file")
+                .required_unless_present("validators-file")
+                .requires(PASSWORD),
+        )
+        .arg(
+            Arg::new(VC_URL_FLAG)
                 .long(VC_URL_FLAG)
                 .value_name("HTTP_ADDRESS")
                 .help(
-                    "A HTTP(S) address of a validator client using the keymanager-API. \
-                    If this value is not supplied then a 'dry run' will be conducted where \
-                    no changes are made to the validator client.",
-                )
+                    "A HTTP(S) address of a validator client using the keymanager-API.")
                 .default_value("http://localhost:5062")
                 .requires(VC_TOKEN_FLAG)
-                .takes_value(true),
+                .action(ArgAction::Set)
+                .display_order(0),
         )
         .arg(
-            Arg::with_name(VC_TOKEN_FLAG)
+            Arg::new(VC_TOKEN_FLAG)
                 .long(VC_TOKEN_FLAG)
                 .value_name("PATH")
                 .help("The file containing a token required by the validator client.")
-                .takes_value(true),
+                .action(ArgAction::Set)
+                .display_order(0),
         )
         .arg(
-            Arg::with_name(IGNORE_DUPLICATES_FLAG)
-                .takes_value(false)
+            Arg::new(IGNORE_DUPLICATES_FLAG)
+                .action(ArgAction::SetTrue)
+                .help_heading(FLAG_HEADER)
                 .long(IGNORE_DUPLICATES_FLAG)
                 .help(
                     "If present, ignore any validators which already exist on the VC. \
@@ -63,34 +94,118 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                     slashable conditions, it might be an indicator that something is amiss. \
                     Users should also be careful to avoid submitting duplicate deposits for \
                     validators that already exist on the VC.",
-                ),
+                )
+                .display_order(0),
+        )
+        .arg(
+            Arg::new(PASSWORD)
+                .long(PASSWORD)
+                .value_name("STRING")
+                .help("Password of the keystore file.")
+                .action(ArgAction::Set)
+                .display_order(0)
+                .requires(KEYSTORE_FILE_FLAG),
+        )
+        .arg(
+            Arg::new(FEE_RECIPIENT)
+                .long(FEE_RECIPIENT)
+                .value_name("ETH1_ADDRESS")
+                .help("When provided, the imported validator will use the suggested fee recipient. Omit this flag to use the default value from the VC.")
+                .action(ArgAction::Set)
+                .display_order(0),
+        )
+        .arg(
+            Arg::new(GAS_LIMIT)
+                .long(GAS_LIMIT)
+                .value_name("UINT64")
+                .help("When provided, the imported validator will use this gas limit. It is recommended \
+                to leave this as the default value by not specifying this flag.",)
+                .action(ArgAction::Set)
+                .display_order(0),
+        )
+        .arg(
+            Arg::new(BUILDER_PROPOSALS)
+                .long(BUILDER_PROPOSALS)
+                .help("When provided, the imported validator will attempt to create \
+                blocks via builder rather than the local EL.",)
+                .value_parser(["true","false"])
+                .action(ArgAction::Set)
+                .display_order(0),
+        )
+        .arg(
+            Arg::new(BUILDER_BOOST_FACTOR)
+                .long(BUILDER_BOOST_FACTOR)
+                .value_name("UINT64")
+                .help("When provided, the imported validator will use this \
+                percentage multiplier to apply to the builder's payload value \
+                when choosing between a builder payload header and payload from \
+                the local execution node.",)
+                .action(ArgAction::Set)
+                .display_order(0),
+        )
+        .arg(
+            Arg::new(PREFER_BUILDER_PROPOSALS)
+                .long(PREFER_BUILDER_PROPOSALS)
+                .help("When provided, the imported validator will always prefer blocks \
+                constructed by builders, regardless of payload value.",)
+                .value_parser(["true","false"])
+                .action(ArgAction::Set)
+                .display_order(0),
+        )
+        .arg(
+            Arg::new(ENABLED)
+                .long(ENABLED)
+                .help("When provided, the imported validator will be \
+                enabled or disabled.",)
+                .value_parser(["true","false"])
+                .action(ArgAction::Set)
+                .display_order(0),
         )
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Educe)]
+#[educe(Debug)]
 pub struct ImportConfig {
-    pub validators_file_path: PathBuf,
+    pub validators_file_path: Option<PathBuf>,
+    pub keystore_file_path: Option<PathBuf>,
     pub vc_url: SensitiveUrl,
     pub vc_token_path: PathBuf,
     pub ignore_duplicates: bool,
+    #[educe(Debug(ignore))]
+    pub password: Option<Zeroizing<String>>,
+    pub fee_recipient: Option<Address>,
+    pub gas_limit: Option<u64>,
+    pub builder_proposals: Option<bool>,
+    pub builder_boost_factor: Option<u64>,
+    pub prefer_builder_proposals: Option<bool>,
+    pub enabled: Option<bool>,
 }
 
 impl ImportConfig {
     fn from_cli(matches: &ArgMatches) -> Result<Self, String> {
         Ok(Self {
-            validators_file_path: clap_utils::parse_required(matches, VALIDATORS_FILE_FLAG)?,
+            validators_file_path: clap_utils::parse_optional(matches, VALIDATORS_FILE_FLAG)?,
+            keystore_file_path: clap_utils::parse_optional(matches, KEYSTORE_FILE_FLAG)?,
             vc_url: clap_utils::parse_required(matches, VC_URL_FLAG)?,
             vc_token_path: clap_utils::parse_required(matches, VC_TOKEN_FLAG)?,
-            ignore_duplicates: matches.is_present(IGNORE_DUPLICATES_FLAG),
+            ignore_duplicates: matches.get_flag(IGNORE_DUPLICATES_FLAG),
+            password: clap_utils::parse_optional(matches, PASSWORD)?.map(Zeroizing::new),
+            fee_recipient: clap_utils::parse_optional(matches, FEE_RECIPIENT)?,
+            gas_limit: clap_utils::parse_optional(matches, GAS_LIMIT)?,
+            builder_proposals: clap_utils::parse_optional(matches, BUILDER_PROPOSALS)?,
+            builder_boost_factor: clap_utils::parse_optional(matches, BUILDER_BOOST_FACTOR)?,
+            prefer_builder_proposals: clap_utils::parse_optional(
+                matches,
+                PREFER_BUILDER_PROPOSALS,
+            )?,
+            enabled: clap_utils::parse_optional(matches, ENABLED)?,
         })
     }
 }
 
-pub async fn cli_run<'a>(
-    matches: &'a ArgMatches<'a>,
-    dump_config: DumpConfig,
-) -> Result<(), String> {
+pub async fn cli_run(matches: &ArgMatches, dump_config: DumpConfig) -> Result<(), String> {
     let config = ImportConfig::from_cli(matches)?;
+
     if dump_config.should_exit_early(&config)? {
         Ok(())
     } else {
@@ -98,30 +213,129 @@ pub async fn cli_run<'a>(
     }
 }
 
-async fn run<'a>(config: ImportConfig) -> Result<(), String> {
+async fn run(config: ImportConfig) -> Result<(), String> {
     let ImportConfig {
         validators_file_path,
+        keystore_file_path,
         vc_url,
         vc_token_path,
         ignore_duplicates,
+        password,
+        fee_recipient,
+        gas_limit,
+        builder_proposals,
+        builder_boost_factor,
+        prefer_builder_proposals,
+        enabled,
     } = config;
 
-    if !validators_file_path.exists() {
-        return Err(format!("Unable to find file at {:?}", validators_file_path));
-    }
+    let validators: Vec<ValidatorSpecification> = if let Some(validators_format_path) =
+        &validators_file_path
+    {
+        if !validators_format_path.exists() {
+            return Err(format!(
+                "Unable to find file at {:?}",
+                validators_format_path
+            ));
+        }
 
-    let validators_file = fs::OpenOptions::new()
-        .read(true)
-        .create(false)
-        .open(&validators_file_path)
-        .map_err(|e| format!("Unable to open {:?}: {:?}", validators_file_path, e))?;
-    let validators: Vec<ValidatorSpecification> = serde_json::from_reader(&validators_file)
-        .map_err(|e| {
-            format!(
-                "Unable to parse JSON in {:?}: {:?}",
-                validators_file_path, e
-            )
-        })?;
+        let validators_file = fs::OpenOptions::new()
+            .read(true)
+            .create(false)
+            .open(validators_format_path)
+            .map_err(|e| format!("Unable to open {:?}: {:?}", validators_format_path, e))?;
+
+        // Define validators as mutable so that if a relevant flag is supplied, the fields can be overridden.
+        let mut validators: Vec<ValidatorSpecification> = serde_json::from_reader(&validators_file)
+            .map_err(|e| {
+                format!(
+                    "Unable to parse JSON in {:?}: {:?}",
+                    validators_format_path, e
+                )
+            })?;
+
+        // Log the overridden note when one or more flags is supplied
+        if let Some(override_fee_recipient) = fee_recipient {
+            eprintln!(
+                "Please note! --suggested-fee-recipient is provided. This will override existing fee recipient defined in validators.json with: {:?}",
+                override_fee_recipient
+            );
+        }
+        if let Some(override_gas_limit) = gas_limit {
+            eprintln!(
+                "Please note! --gas-limit is provided. This will override existing gas limit defined in validators.json with: {}",
+                override_gas_limit
+            );
+        }
+        if let Some(override_builder_proposals) = builder_proposals {
+            eprintln!(
+                "Please note! --builder-proposals is provided. This will override existing builder proposal setting defined in validators.json with: {}",
+                override_builder_proposals
+            );
+        }
+        if let Some(override_builder_boost_factor) = builder_boost_factor {
+            eprintln!(
+                "Please note! --builder-boost-factor is provided. This will override existing builder boost factor defined in validators.json with: {}",
+                override_builder_boost_factor
+            );
+        }
+        if let Some(override_prefer_builder_proposals) = prefer_builder_proposals {
+            eprintln!(
+                "Please note! --prefer-builder-proposals is provided. This will override existing prefer builder proposal setting defined in validators.json with: {}",
+                override_prefer_builder_proposals
+            );
+        }
+        if let Some(override_enabled) = enabled {
+            eprintln!(
+                "Please note! --enabled flag is provided. This will override existing setting defined in validators.json with: {}",
+                override_enabled
+            );
+        }
+
+        // Override the fields in validators.json file if the flag is supplied
+        for validator in &mut validators {
+            if let Some(override_fee_recipient) = fee_recipient {
+                validator.fee_recipient = Some(override_fee_recipient);
+            }
+            if let Some(override_gas_limit) = gas_limit {
+                validator.gas_limit = Some(override_gas_limit);
+            }
+            if let Some(override_builder_proposals) = builder_proposals {
+                validator.builder_proposals = Some(override_builder_proposals);
+            }
+            if let Some(override_builder_boost_factor) = builder_boost_factor {
+                validator.builder_boost_factor = Some(override_builder_boost_factor);
+            }
+            if let Some(override_prefer_builder_proposals) = prefer_builder_proposals {
+                validator.prefer_builder_proposals = Some(override_prefer_builder_proposals);
+            }
+            if let Some(override_enabled) = enabled {
+                validator.enabled = Some(override_enabled);
+            }
+        }
+
+        validators
+    } else if let Some(keystore_format_path) = &keystore_file_path {
+        vec![ValidatorSpecification {
+            voting_keystore: KeystoreJsonStr(
+                Keystore::from_json_file(keystore_format_path).map_err(|e| format!("{e:?}"))?,
+            ),
+            voting_keystore_password: password.ok_or_else(|| {
+                "The --password flag is required to supply the keystore password".to_string()
+            })?,
+            slashing_protection: None,
+            fee_recipient,
+            gas_limit,
+            builder_proposals,
+            builder_boost_factor,
+            prefer_builder_proposals,
+            enabled,
+        }]
+    } else {
+        return Err(format!(
+            "One of the flag --{VALIDATORS_FILE_FLAG} or --{KEYSTORE_FILE_FLAG} is required."
+        ));
+    };
 
     let count = validators.len();
 
@@ -134,38 +348,38 @@ async fn run<'a>(config: ImportConfig) -> Result<(), String> {
 
     for (i, validator) in validators.into_iter().enumerate() {
         match validator.upload(&http_client, ignore_duplicates).await {
-            Ok(status) => {
-                match status.status {
-                    ImportKeystoreStatus::Imported => {
-                        eprintln!("Uploaded keystore {} of {} to the VC", i + 1, count)
-                    }
-                    ImportKeystoreStatus::Duplicate => {
-                        if ignore_duplicates {
-                            eprintln!("Re-uploaded keystore {} of {} to the VC", i + 1, count)
-                        } else {
-                            eprintln!(
-                                "Keystore {} of {} was uploaded to the VC, but it was a duplicate. \
-                                Exiting now, use --{} to allow duplicates.",
-                                i + 1, count, IGNORE_DUPLICATES_FLAG
-                            );
-                            return Err(DETECTED_DUPLICATE_MESSAGE.to_string());
-                        }
-                    }
-                    ImportKeystoreStatus::Error => {
+            Ok(status) => match status.status {
+                ImportKeystoreStatus::Imported => {
+                    eprintln!("Uploaded keystore {} of {} to the VC", i + 1, count)
+                }
+                ImportKeystoreStatus::Duplicate => {
+                    if ignore_duplicates {
+                        eprintln!("Re-uploaded keystore {} of {} to the VC", i + 1, count)
+                    } else {
                         eprintln!(
-                            "Upload of keystore {} of {} failed with message: {:?}. \
+                            "Keystore {} of {} was uploaded to the VC, but it was a duplicate. \
+                                Exiting now, use --{} to allow duplicates.",
+                            i + 1,
+                            count,
+                            IGNORE_DUPLICATES_FLAG
+                        );
+                        return Err(DETECTED_DUPLICATE_MESSAGE.to_string());
+                    }
+                }
+                ImportKeystoreStatus::Error => {
+                    eprintln!(
+                        "Upload of keystore {} of {} failed with message: {:?}. \
                                 A potential solution is run this command again \
                                 using the --{} flag, however care should be taken to ensure \
                                 that there are no duplicate deposits submitted.",
-                            i + 1,
-                            count,
-                            status.message,
-                            IGNORE_DUPLICATES_FLAG
-                        );
-                        return Err(format!("Upload failed with {:?}", status.message));
-                    }
+                        i + 1,
+                        count,
+                        status.message,
+                        IGNORE_DUPLICATES_FLAG
+                    );
+                    return Err(format!("Upload failed with {:?}", status.message));
                 }
-            }
+            },
             e @ Err(UploadError::InvalidPublicKey) => {
                 eprintln!("Validator {} has an invalid public key", i);
                 return Err(format!("{:?}", e));
@@ -238,9 +452,9 @@ async fn run<'a>(config: ImportConfig) -> Result<(), String> {
 pub mod tests {
     use super::*;
     use crate::create_validators::tests::TestBuilder as CreateTestBuilder;
-    use std::fs;
-    use tempfile::{tempdir, TempDir};
-    use validator_client::http_api::{test_utils::ApiTester, Config as HttpConfig};
+    use std::fs::{self, File};
+    use tempfile::{TempDir, tempdir};
+    use validator_http_api::{Config as HttpConfig, test_utils::ApiTester};
 
     const VC_TOKEN_FILE_NAME: &str = "vc_token.json";
 
@@ -259,18 +473,30 @@ pub mod tests {
         }
 
         pub async fn new_with_http_config(http_config: HttpConfig) -> Self {
-            let dir = tempdir().unwrap();
             let vc = ApiTester::new_with_http_config(http_config).await;
+            Self::new_with_vc(vc).await
+        }
+
+        pub async fn new_with_vc(vc: ApiTester) -> Self {
+            let dir = tempdir().unwrap();
             let vc_token_path = dir.path().join(VC_TOKEN_FILE_NAME);
             fs::write(&vc_token_path, &vc.api_token).unwrap();
 
             Self {
                 import_config: ImportConfig {
                     // This field will be overwritten later on.
-                    validators_file_path: dir.path().into(),
+                    validators_file_path: Some(dir.path().into()),
+                    keystore_file_path: Some(dir.path().into()),
                     vc_url: vc.url.clone(),
                     vc_token_path,
                     ignore_duplicates: false,
+                    password: Some(Zeroizing::new("password".into())),
+                    fee_recipient: None,
+                    builder_boost_factor: None,
+                    gas_limit: None,
+                    builder_proposals: None,
+                    enabled: None,
+                    prefer_builder_proposals: None,
                 },
                 vc,
                 create_dir: None,
@@ -281,6 +507,10 @@ pub mod tests {
         pub fn mutate_import_config<F: Fn(&mut ImportConfig)>(mut self, func: F) -> Self {
             func(&mut self.import_config);
             self
+        }
+
+        pub fn get_import_config(&self) -> ImportConfig {
+            self.import_config.clone()
         }
 
         pub async fn create_validators(mut self, count: u32, first_index: u32) -> Self {
@@ -295,7 +525,55 @@ pub mod tests {
                 create_result.result.is_ok(),
                 "precondition: validators are created"
             );
-            self.import_config.validators_file_path = create_result.validators_file_path();
+            self.import_config.validators_file_path = Some(create_result.validators_file_path());
+            self.create_dir = Some(create_result.output_dir);
+            self
+        }
+
+        // Keystore JSON requires a different format when creating valdiators
+        pub async fn create_validators_keystore_format(
+            mut self,
+            count: u32,
+            first_index: u32,
+        ) -> Self {
+            let create_result = CreateTestBuilder::default()
+                .mutate_config(|config| {
+                    config.count = count;
+                    config.first_index = first_index;
+                })
+                .run_test()
+                .await;
+            assert!(
+                create_result.result.is_ok(),
+                "precondition: validators are created"
+            );
+
+            let validators_file_path = create_result.validators_file_path();
+
+            let validators_file = fs::OpenOptions::new()
+                .read(true)
+                .create(false)
+                .open(&validators_file_path)
+                .map_err(|e| format!("Unable to open {:?}: {:?}", validators_file_path, e))
+                .unwrap();
+
+            let validators: Vec<ValidatorSpecification> = serde_json::from_reader(&validators_file)
+                .map_err(|e| {
+                    format!(
+                        "Unable to parse JSON in {:?}: {:?}",
+                        validators_file_path, e
+                    )
+                })
+                .unwrap();
+
+            let validator = &validators[0];
+            let validator_json = validator.voting_keystore.0.clone();
+
+            let keystore_file = File::create(&validators_file_path).unwrap();
+            let _ = validator_json.to_json_writer(keystore_file);
+
+            self.import_config.keystore_file_path = Some(create_result.validators_file_path());
+            self.import_config.password = Some(validator.voting_keystore_password.clone());
             self.create_dir = Some(create_result.output_dir);
             self
         }
@@ -315,7 +593,8 @@ pub mod tests {
 
                 let local_validators: Vec<ValidatorSpecification> = {
                     let contents =
-                        fs::read_to_string(&self.import_config.validators_file_path).unwrap();
+                        fs::read_to_string(self.import_config.validators_file_path.unwrap())
+                            .unwrap();
                     serde_json::from_str(&contents).unwrap()
                 };
                 let list_keystores_response = self.vc.client.get_keystores().await.unwrap().data;
@@ -336,6 +615,39 @@ pub mod tests {
                     assert_eq!(&remote_validator.derivation_path, &local_keystore.path());
                     assert_eq!(remote_validator.readonly, Some(false));
                 }
+            }
+
+            TestResult {
+                result,
+                vc: self.vc,
+            }
+        }
+
+        pub async fn run_test_keystore_format(self) -> TestResult {
+            let result = run(self.import_config.clone()).await;
+
+            if result.is_ok() {
+                self.vc.ensure_key_cache_consistency().await;
+
+                let local_keystore: Keystore =
+                    Keystore::from_json_file(self.import_config.keystore_file_path.unwrap())
+                        .unwrap();
+
+                let list_keystores_response = self.vc.client.get_keystores().await.unwrap().data;
+
+                assert_eq!(
+                    1,
+                    list_keystores_response.len(),
+                    "vc should have exactly the number of validators imported"
+                );
+
+                let local_pubkey = local_keystore.public_key().unwrap().into();
+                let remote_validator = list_keystores_response
+                    .iter()
+                    .find(|validator| validator.validating_pubkey == local_pubkey)
+                    .expect("validator must exist on VC");
+                assert_eq!(&remote_validator.derivation_path, &local_keystore.path());
+                assert_eq!(remote_validator.readonly, Some(false));
             }
 
             TestResult {
@@ -430,6 +742,68 @@ pub mod tests {
             .import_validators_without_checks()
             .await
             .run_test()
+            .await
+            .assert_ok();
+    }
+
+    #[tokio::test]
+    async fn create_one_validator_keystore_format() {
+        TestBuilder::new()
+            .await
+            .mutate_import_config(|config| {
+                // Set validators_file_path to None so that keystore_file_path is used for tests with the keystore format
+                config.validators_file_path = None;
+            })
+            .create_validators_keystore_format(1, 0)
+            .await
+            .run_test_keystore_format()
+            .await
+            .assert_ok();
+    }
+
+    #[tokio::test]
+    async fn create_one_validator_with_offset_keystore_format() {
+        TestBuilder::new()
+            .await
+            .mutate_import_config(|config| {
+                config.validators_file_path = None;
+            })
+            .create_validators_keystore_format(1, 42)
+            .await
+            .run_test_keystore_format()
+            .await
+            .assert_ok();
+    }
+
+    #[tokio::test]
+    async fn import_duplicates_when_disallowed_keystore_format() {
+        TestBuilder::new()
+            .await
+            .mutate_import_config(|config| {
+                config.validators_file_path = None;
+            })
+            .create_validators_keystore_format(1, 0)
+            .await
+            .import_validators_without_checks()
+            .await
+            .run_test_keystore_format()
+            .await
+            .assert_err_contains("DuplicateValidator");
+    }
+
+    #[tokio::test]
+    async fn import_duplicates_when_allowed_keystore_format() {
+        TestBuilder::new()
+            .await
+            .mutate_import_config(|config| {
+                config.ignore_duplicates = true;
+                config.validators_file_path = None;
+            })
+            .create_validators_keystore_format(1, 0)
+            .await
+            .import_validators_without_checks()
+            .await
+            .run_test_keystore_format()
             .await
             .assert_ok();
     }

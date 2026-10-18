@@ -1,12 +1,12 @@
 #![cfg(feature = "mdbx")]
 
 use crate::{
+    Config, Error,
     config::MEGABYTE,
     database::{
         interface::{Key, OpenDatabases, Value},
         *,
     },
-    Config, Error,
 };
 use mdbx::{DatabaseFlags, Geometry, WriteFlags};
 use std::borrow::Cow;
@@ -44,7 +44,7 @@ impl Environment {
         Ok(Environment { env })
     }
 
-    pub fn create_databases(&self) -> Result<OpenDatabases, Error> {
+    pub fn create_databases(&self) -> Result<OpenDatabases<'_>, Error> {
         let txn = self.begin_rw_txn()?;
         txn.create_db(INDEXED_ATTESTATION_DB)?;
         txn.create_db(INDEXED_ATTESTATION_ID_DB)?;
@@ -77,7 +77,7 @@ impl Environment {
         })
     }
 
-    pub fn begin_rw_txn(&self) -> Result<RwTransaction, Error> {
+    pub fn begin_rw_txn(&self) -> Result<RwTransaction<'_>, Error> {
         let txn = self.env.begin_rw_txn()?;
         Ok(RwTransaction { txn })
     }
@@ -106,14 +106,14 @@ impl<'env> RwTransaction<'env> {
         Ok(())
     }
 
-    pub fn open_db(&self, name: &'static str) -> Result<Database, Error> {
+    pub fn open_db(&self, name: &'static str) -> Result<Database<'_>, Error> {
         let db = self.txn.open_db(Some(name))?;
         Ok(Database { db })
     }
 
     pub fn get<K: AsRef<[u8]> + ?Sized>(
         &'env self,
-        db: &Database<'env>,
+        db: &'env Database,
         key: &K,
     ) -> Result<Option<Cow<'env, [u8]>>, Error> {
         Ok(self.txn.get(&db.db, key.as_ref())?)
@@ -182,5 +182,28 @@ impl<'env> Cursor<'env> {
         self.cursor
             .put(key.as_ref(), value.as_ref(), RwTransaction::write_flags())?;
         Ok(())
+    }
+
+    pub fn delete_while(
+        &mut self,
+        f: impl Fn(&[u8]) -> Result<bool, Error>,
+    ) -> Result<Vec<Cow<'_, [u8]>>, Error> {
+        let mut result = vec![];
+
+        loop {
+            let (key_bytes, value) = self.get_current()?.ok_or(Error::MissingKey)?;
+
+            if f(&key_bytes)? {
+                result.push(value);
+                self.delete_current()?;
+                if self.next_key()?.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(result)
     }
 }
