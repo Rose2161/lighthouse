@@ -1,11 +1,12 @@
 use super::*;
+use context_deserialize::ContextDeserialize;
 use fs2::FileExt;
 use snap::raw::Decoder;
 use std::fs::{self};
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use types::{BeaconState, EthSpec};
+use types::{BeaconState, LightClientUpdate};
 
 /// See `log_file_access` for details.
 const ACCESSED_FILE_LOG_FILENAME: &str = ".accessed_file_log.txt";
@@ -28,11 +29,32 @@ pub fn log_file_access<P: AsRef<Path>>(file_accessed: P) {
 
     writeln!(&mut file, "{:?}", file_accessed.as_ref()).expect("should write to file");
 
-    file.unlock().expect("unable to unlock file");
+    fs2::FileExt::unlock(&file).expect("unable to unlock file");
 }
 
 pub fn yaml_decode<T: serde::de::DeserializeOwned>(string: &str) -> Result<T, Error> {
-    serde_yaml::from_str(string).map_err(|e| Error::FailedToParseTest(format!("{:?}", e)))
+    yaml_serde::from_str(string).map_err(|e| Error::FailedToParseTest(format!("{:?}", e)))
+}
+
+pub fn context_yaml_decode<'de, T, C>(string: &'de str, context: C) -> Result<T, Error>
+where
+    T: ContextDeserialize<'de, C>,
+{
+    let deserializer = yaml_serde::Deserializer::from_str(string);
+    T::context_deserialize(deserializer, context)
+        .map_err(|e| Error::FailedToParseTest(format!("{:?}", e)))
+}
+
+pub fn context_yaml_decode_file<T, C>(path: &Path, context: C) -> Result<T, Error>
+where
+    T: for<'de> ContextDeserialize<'de, C>,
+{
+    log_file_access(path);
+    fs::read_to_string(path)
+        .map_err(|e| {
+            Error::FailedToParseTest(format!("Unable to load {}: {:?}", path.display(), e))
+        })
+        .and_then(|s| context_yaml_decode(&s, context))
 }
 
 pub fn yaml_decode_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
@@ -71,9 +93,7 @@ where
     f(&bytes).map_err(|e| {
         match e {
             // NOTE: this is a bit hacky, but seemingly better than the alternatives
-            ssz::DecodeError::BytesInvalid(message)
-                if message.contains("Blst") || message.contains("Milagro") =>
-            {
+            ssz::DecodeError::BytesInvalid(message) if message.contains("Blst") => {
                 Error::InvalidBLSInput(message)
             }
             e => Error::FailedToParseTest(format!(
@@ -96,4 +116,14 @@ pub fn ssz_decode_state<E: EthSpec>(
 ) -> Result<BeaconState<E>, Error> {
     log_file_access(path);
     ssz_decode_file_with(path, |bytes| BeaconState::from_ssz_bytes(bytes, spec))
+}
+
+pub fn ssz_decode_light_client_update<E: EthSpec>(
+    path: &Path,
+    fork_name: &ForkName,
+) -> Result<LightClientUpdate<E>, Error> {
+    log_file_access(path);
+    ssz_decode_file_with(path, |bytes| {
+        LightClientUpdate::from_ssz_bytes(bytes, fork_name)
+    })
 }

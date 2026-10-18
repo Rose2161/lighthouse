@@ -4,6 +4,7 @@ use std::future::Future;
 use tokio::sync::{mpsc::error::TrySendError, oneshot};
 use types::EthSpec;
 use warp::reply::{Reply, Response};
+use warp_utils::reject::convert_rejection;
 
 /// Maps a request to a queue in the `BeaconProcessor`.
 #[derive(Clone, Copy)]
@@ -29,28 +30,11 @@ impl Priority {
 }
 
 /// Spawns tasks on the `BeaconProcessor` or directly on the tokio executor.
+#[derive(Clone)]
 pub struct TaskSpawner<E: EthSpec> {
     /// Used to send tasks to the `BeaconProcessor`. The tokio executor will be
     /// used if this is `None`.
     beacon_processor_send: Option<BeaconProcessorSend<E>>,
-}
-
-/// Convert a warp `Rejection` into a `Response`.
-///
-/// This function should *always* be used to convert rejections into responses. This prevents warp
-/// from trying to backtrack in strange ways. See: https://github.com/sigp/lighthouse/issues/3404
-pub async fn convert_rejection<T: Reply>(res: Result<T, warp::Rejection>) -> Response {
-    match res {
-        Ok(response) => response.into_response(),
-        Err(e) => match warp_utils::reject::handle_rejection(e).await {
-            Ok(reply) => reply.into_response(),
-            Err(_) => warp::reply::with_status(
-                warp::reply::json(&"unhandled error"),
-                eth2::StatusCode::INTERNAL_SERVER_ERROR,
-            )
-            .into_response(),
-        },
-    }
 }
 
 impl<E: EthSpec> TaskSpawner<E> {
@@ -60,11 +44,15 @@ impl<E: EthSpec> TaskSpawner<E> {
         }
     }
 
-    /// Executes a "blocking" (non-async) task which returns a `Response`.
-    pub async fn blocking_response_task<F, T>(self, priority: Priority, func: F) -> Response
+    /// Executes a "blocking" (non-async) task which returns an arbitrary value.
+    pub async fn blocking_task<F, T>(
+        self,
+        priority: Priority,
+        func: F,
+    ) -> Result<T, warp::Rejection>
     where
         F: FnOnce() -> Result<T, warp::Rejection> + Send + Sync + 'static,
-        T: Reply + Send + 'static,
+        T: Send + 'static,
     {
         if let Some(beacon_processor_send) = &self.beacon_processor_send {
             // Create a closure that will execute `func` and send the result to
@@ -79,20 +67,29 @@ impl<E: EthSpec> TaskSpawner<E> {
             };
 
             // Send the function to the beacon processor for execution at some arbitrary time.
-            let result = send_to_beacon_processor(
+            send_to_beacon_processor(
                 beacon_processor_send,
                 priority,
                 BlockingOrAsync::Blocking(Box::new(process_fn)),
                 rx,
             )
             .await
-            .and_then(|x| x);
-            convert_rejection(result).await
+            .and_then(|x| x)
         } else {
             // There is no beacon processor so spawn a task directly on the
             // tokio executor.
-            convert_rejection(warp_utils::task::blocking_response_task(func).await).await
+            warp_utils::task::blocking_task(func).await
         }
+    }
+
+    /// Executes a "blocking" (non-async) task which returns a `Response`.
+    pub async fn blocking_response_task<F, T>(self, priority: Priority, func: F) -> Response
+    where
+        F: FnOnce() -> Result<T, warp::Rejection> + Send + Sync + 'static,
+        T: Reply + Send + 'static,
+    {
+        let result = self.blocking_task(priority, func).await;
+        convert_rejection(result).await
     }
 
     /// Executes a "blocking" (non-async) task which returns a JSON-serializable
@@ -157,6 +154,32 @@ impl<E: EthSpec> TaskSpawner<E> {
                     warp_utils::reject::custom_server_error("Tokio failed to spawn task".into())
                 })
                 .and_then(|x| x)
+        }
+    }
+
+    pub fn try_send(&self, work_event: WorkEvent<E>) -> Result<(), warp::Rejection> {
+        if let Some(beacon_processor_send) = &self.beacon_processor_send {
+            let error_message = match beacon_processor_send.try_send(work_event) {
+                Ok(()) => None,
+                Err(TrySendError::Full(_)) => {
+                    Some("The task was dropped. The server is overloaded.")
+                }
+                Err(TrySendError::Closed(_)) => {
+                    Some("The task was dropped. The server is shutting down.")
+                }
+            };
+
+            if let Some(error_message) = error_message {
+                return Err(warp_utils::reject::custom_server_error(
+                    error_message.to_string(),
+                ));
+            };
+
+            Ok(())
+        } else {
+            Err(warp_utils::reject::custom_server_error(
+                "The beacon processor is unavailable".to_string(),
+            ))
         }
     }
 }

@@ -1,9 +1,9 @@
 use crate::{BeaconChain, BeaconChainError, BeaconChainTypes};
+use hashlink::lru_cache::LruCache;
 use itertools::process_results;
-use lru::LruCache;
 use parking_lot::Mutex;
-use slog::debug;
 use std::time::Duration;
+use tracing::debug;
 use types::Hash256;
 
 const BLOCK_ROOT_CACHE_LIMIT: usize = 512;
@@ -47,13 +47,13 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let mut cache = self.pre_finalization_block_cache.cache.lock();
 
         // Check the cache to see if we already know this pre-finalization block root.
-        if cache.block_roots.contains(&block_root) {
+        if cache.block_roots.contains_key(&block_root) {
             return Ok(true);
         }
 
         // Avoid repeating the disk lookup for blocks that are already subject to a network lookup.
         // Sync will take care of de-duplicating the single block lookups.
-        if cache.in_progress_lookups.contains(&block_root) {
+        if cache.in_progress_lookups.contains_key(&block_root) {
             return Ok(false);
         }
 
@@ -66,18 +66,18 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .map_err(BeaconChainError::BeaconStateError)
         })?;
         if is_recent_finalized_block {
-            cache.block_roots.put(block_root, ());
+            cache.block_roots.insert(block_root, ());
             return Ok(true);
         }
 
         // 2. Check on disk.
         if self.store.get_blinded_block(&block_root)?.is_some() {
-            cache.block_roots.put(block_root, ());
+            cache.block_roots.insert(block_root, ());
             return Ok(true);
         }
 
         // 3. Check the network with a single block lookup.
-        cache.in_progress_lookups.put(block_root, ());
+        cache.in_progress_lookups.insert(block_root, ());
         if cache.in_progress_lookups.len() == LOOKUP_LIMIT {
             // NOTE: we expect this to occur sometimes if a lot of blocks that we look up fail to be
             // imported for reasons other than being pre-finalization. The cache will eventually
@@ -85,10 +85,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             // blocks have been flushed out. Solving this issue isn't as simple as hooking the
             // beacon processor's functions that handle failed blocks because we need the block root
             // and it has been erased from the `BlockError` by that point.
-            debug!(
-                self.log,
-                "Pre-finalization lookup cache is full";
-            );
+            debug!("Pre-finalization lookup cache is full");
         }
         Ok(false)
     }
@@ -96,8 +93,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     pub fn pre_finalization_block_rejected(&self, block_root: Hash256) {
         // Future requests can know that this block is invalid without having to look it up again.
         let mut cache = self.pre_finalization_block_cache.cache.lock();
-        cache.in_progress_lookups.pop(&block_root);
-        cache.block_roots.put(block_root, ());
+        cache.in_progress_lookups.remove(&block_root);
+        cache.block_roots.insert(block_root, ());
     }
 }
 
@@ -105,11 +102,11 @@ impl PreFinalizationBlockCache {
     pub fn block_processed(&self, block_root: Hash256) {
         // Future requests will find this block in fork choice, so no need to cache it in the
         // ongoing lookup cache any longer.
-        self.cache.lock().in_progress_lookups.pop(&block_root);
+        self.cache.lock().in_progress_lookups.remove(&block_root);
     }
 
     pub fn contains(&self, block_root: Hash256) -> bool {
-        self.cache.lock().block_roots.contains(&block_root)
+        self.cache.lock().block_roots.contains_key(&block_root)
     }
 
     pub fn metrics(&self) -> Option<(usize, usize)> {

@@ -1,14 +1,13 @@
 use crate::{Error as DirError, ValidatorDir};
-use bls::get_withdrawal_credentials;
-use deposit_contract::{encode_eth1_tx_data, Error as DepositError};
-use directory::ensure_dir_exists;
+use bls::{Keypair, Signature, get_withdrawal_credentials};
+use deposit_contract::{Error as DepositError, encode_eth1_tx_data};
 use eth2_keystore::{Error as KeystoreError, Keystore, KeystoreBuilder, PlainText};
 use filesystem::create_with_600_perms;
-use rand::{distributions::Alphanumeric, Rng};
-use std::fs::{create_dir_all, File};
+use rand::{Rng, distr::Alphanumeric};
+use std::fs::{File, create_dir_all};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use types::{ChainSpec, DepositData, Hash256, Keypair, Signature};
+use types::{ChainSpec, DepositData, Hash256};
 
 /// The `Alphanumeric` crate only generates a-z, A-Z, 0-9, therefore it has a range of 62
 /// characters.
@@ -42,7 +41,7 @@ pub enum Error {
     #[cfg(feature = "insecure_keys")]
     InsecureKeysError(String),
     MissingPasswordDir,
-    UnableToCreatePasswordDir(String),
+    UnableToCreatePasswordDir(io::Error),
 }
 
 impl From<KeystoreError> for Error {
@@ -163,7 +162,7 @@ impl<'a> Builder<'a> {
         }
 
         if let Some(password_dir) = &self.password_dir {
-            ensure_dir_exists(password_dir).map_err(Error::UnableToCreatePasswordDir)?;
+            create_dir_all(password_dir).map_err(Error::UnableToCreatePasswordDir)?;
         }
 
         // The withdrawal keystore must be initialized in order to store it or create an eth1
@@ -214,6 +213,7 @@ impl<'a> Builder<'a> {
                         .write(true)
                         .read(true)
                         .create(true)
+                        .truncate(true)
                         .open(path)
                         .map_err(Error::UnableToSaveDepositData)?
                         .write_all(hex.as_bytes())
@@ -231,6 +231,7 @@ impl<'a> Builder<'a> {
                         .write(true)
                         .read(true)
                         .create(true)
+                        .truncate(true)
                         .open(path)
                         .map_err(Error::UnableToSaveDepositAmount)?
                         .write_all(format!("{}", amount).as_bytes())
@@ -313,7 +314,7 @@ pub fn write_password_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> Result<(
 /// Generates a random keystore with a random password.
 fn random_keystore() -> Result<(Keystore, PlainText), Error> {
     let keypair = Keypair::random();
-    let password: PlainText = rand::thread_rng()
+    let password: PlainText = rand::rng()
         .sample_iter(&Alphanumeric)
         .take(DEFAULT_PASSWORD_LEN)
         .map(char::from)

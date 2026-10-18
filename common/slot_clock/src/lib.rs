@@ -1,17 +1,13 @@
-#[macro_use]
-extern crate lazy_static;
-
 mod manual_slot_clock;
 mod metrics;
 mod system_time_slot_clock;
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use crate::manual_slot_clock::ManualSlotClock;
 pub use crate::manual_slot_clock::ManualSlotClock as TestingSlotClock;
+pub use crate::manual_slot_clock::ManualSlotClock;
 pub use crate::system_time_slot_clock::SystemTimeSlotClock;
 pub use metrics::scrape_for_metrics;
-use types::consts::merge::INTERVALS_PER_SLOT;
 pub use types::Slot;
 
 /// A clock that reports the current slot.
@@ -80,30 +76,6 @@ pub trait SlotClock: Send + Sync + Sized + Clone {
             .or_else(|| Some(self.genesis_slot()))
     }
 
-    /// Returns the delay between the start of the slot and when unaggregated attestations should be
-    /// produced.
-    fn unagg_attestation_production_delay(&self) -> Duration {
-        self.slot_duration() / INTERVALS_PER_SLOT as u32
-    }
-
-    /// Returns the delay between the start of the slot and when sync committee messages should be
-    /// produced.
-    fn sync_committee_message_production_delay(&self) -> Duration {
-        self.slot_duration() / INTERVALS_PER_SLOT as u32
-    }
-
-    /// Returns the delay between the start of the slot and when aggregated attestations should be
-    /// produced.
-    fn agg_attestation_production_delay(&self) -> Duration {
-        self.slot_duration() * 2 / INTERVALS_PER_SLOT as u32
-    }
-
-    /// Returns the delay between the start of the slot and when partially aggregated `SyncCommitteeContribution` should be
-    /// produced.
-    fn sync_committee_contribution_production_delay(&self) -> Duration {
-        self.slot_duration() * 2 / INTERVALS_PER_SLOT as u32
-    }
-
     /// Returns the `Duration` since the start of the current `Slot` at seconds precision. Useful in determining whether to apply proposer boosts.
     fn seconds_from_current_slot_start(&self) -> Option<Duration> {
         self.now_duration()
@@ -137,4 +109,14 @@ pub trait SlotClock: Send + Sync + Sized + Clone {
         slot_clock.set_current_time(freeze_at);
         slot_clock
     }
+}
+
+/// Returns the current system time as a duration since the UNIX epoch.
+///
+/// This is a convenience function for recording timestamps when `SlotClock` is not available.
+/// Prefer `SlotClock::now_duration` if available.
+pub fn timestamp_now() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
 }

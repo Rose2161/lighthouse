@@ -1,11 +1,17 @@
 use crate::errors::BeaconChainError;
 use crate::{BeaconChainTypes, BeaconStore};
+use bls::PUBLIC_KEY_UNCOMPRESSED_BYTES_LEN;
+use bls::{PublicKey, PublicKeyBytes};
+use fixed_bytes::FixedBytesExtended;
+use rayon::prelude::*;
+use smallvec::SmallVec;
 use ssz::{Decode, Encode};
+use ssz_derive::{Decode, Encode};
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::marker::PhantomData;
 use store::{DBColumn, Error as StoreError, StoreItem, StoreOp};
-use types::{BeaconState, Hash256, PublicKey, PublicKeyBytes};
+use tracing::instrument;
+use types::{BeaconState, Hash256};
 
 /// Provides a mapping of `validator_index -> validator_publickey`.
 ///
@@ -26,6 +32,7 @@ impl<T: BeaconChainTypes> ValidatorPubkeyCache<T> {
     /// Create a new public key cache using the keys in `state.validators`.
     ///
     /// The new cache will be updated with the keys from `state` and immediately written to disk.
+    #[instrument(name = "validator_pubkey_cache_new", skip_all)]
     pub fn new(
         state: &BeaconState<T::EthSpec>,
         store: BeaconStore<T>,
@@ -38,26 +45,26 @@ impl<T: BeaconChainTypes> ValidatorPubkeyCache<T> {
         };
 
         let store_ops = cache.import_new_pubkeys(state)?;
-        store.do_atomically(store_ops)?;
+        store.do_atomically_with_block_and_blobs_cache(store_ops)?;
 
         Ok(cache)
     }
 
     /// Load the pubkey cache from the given on-disk database.
+    #[instrument(name = "validator_pubkey_cache_load_from_store", skip_all)]
     pub fn load_from_store(store: BeaconStore<T>) -> Result<Self, BeaconChainError> {
         let mut pubkeys = vec![];
         let mut indices = HashMap::new();
         let mut pubkey_bytes = vec![];
 
         for validator_index in 0.. {
-            if let Some(DatabasePubkey(pubkey)) =
+            if let Some(db_pubkey) =
                 store.get_item(&DatabasePubkey::key_for_index(validator_index))?
             {
-                pubkeys.push((&pubkey).try_into().map_err(|e| {
-                    BeaconChainError::ValidatorPubkeyCacheError(format!("{:?}", e))
-                })?);
-                pubkey_bytes.push(pubkey);
-                indices.insert(pubkey, validator_index);
+                let (pk, pk_bytes) = DatabasePubkey::as_pubkey(&db_pubkey)?;
+                pubkeys.push(pk);
+                indices.insert(pk_bytes, validator_index);
+                pubkey_bytes.push(pk_bytes);
             } else {
                 break;
             }
@@ -76,14 +83,16 @@ impl<T: BeaconChainTypes> ValidatorPubkeyCache<T> {
     /// Does not delete any keys from `self` if they don't appear in `state`.
     ///
     /// NOTE: The caller *must* commit the returned I/O batch as part of the block import process.
+    #[instrument(skip_all)]
     pub fn import_new_pubkeys(
         &mut self,
         state: &BeaconState<T::EthSpec>,
     ) -> Result<Vec<StoreOp<'static, T::EthSpec>>, BeaconChainError> {
         if state.validators().len() > self.pubkeys.len() {
             self.import(
-                state.validators()[self.pubkeys.len()..]
-                    .iter()
+                state
+                    .validators()
+                    .iter_from(self.pubkeys.len())?
                     .map(|v| v.pubkey),
             )
         } else {
@@ -104,29 +113,58 @@ impl<T: BeaconChainTypes> ValidatorPubkeyCache<T> {
         self.indices.reserve(validator_keys.len());
 
         let mut store_ops = Vec::with_capacity(validator_keys.len());
-        for pubkey in validator_keys {
-            let i = self.pubkeys.len();
 
-            if self.indices.contains_key(&pubkey) {
-                return Err(BeaconChainError::DuplicateValidatorPublicKey);
+        let is_initial_import = self.pubkeys.is_empty();
+
+        // Helper to insert a decompressed key
+        let mut insert_key =
+            |pubkey_bytes: PublicKeyBytes, pubkey: PublicKey| -> Result<(), BeaconChainError> {
+                let i = self.pubkeys.len();
+
+                if self.indices.contains_key(&pubkey_bytes) {
+                    return Err(BeaconChainError::DuplicateValidatorPublicKey);
+                }
+
+                // Stage the new validator key for writing to disk.
+                // It will be committed atomically when the block that introduced it is written to disk.
+                // Notably it is NOT written while the write lock on the cache is held.
+                // See: https://github.com/sigp/lighthouse/issues/2327
+                store_ops.push(StoreOp::KeyValueOp(
+                    DatabasePubkey::from_pubkey(&pubkey)
+                        .as_kv_store_op(DatabasePubkey::key_for_index(i)),
+                ));
+
+                self.pubkeys.push(pubkey);
+                self.pubkey_bytes.push(pubkey_bytes);
+                self.indices.insert(pubkey_bytes, i);
+                Ok(())
+            };
+
+        if is_initial_import {
+            // On first startup, decompress keys in parallel for better performance
+            let validator_keys_vec: Vec<PublicKeyBytes> = validator_keys.collect();
+
+            let decompressed: Vec<(PublicKeyBytes, PublicKey)> = validator_keys_vec
+                .into_par_iter()
+                .map(|pubkey_bytes| {
+                    let pubkey = (&pubkey_bytes)
+                        .try_into()
+                        .map_err(BeaconChainError::InvalidValidatorPubkeyBytes)?;
+                    Ok((pubkey_bytes, pubkey))
+                })
+                .collect::<Result<Vec<_>, BeaconChainError>>()?;
+
+            for (pubkey_bytes, pubkey) in decompressed {
+                insert_key(pubkey_bytes, pubkey)?;
             }
-
-            // Stage the new validator key for writing to disk.
-            // It will be committed atomically when the block that introduced it is written to disk.
-            // Notably it is NOT written while the write lock on the cache is held.
-            // See: https://github.com/sigp/lighthouse/issues/2327
-            store_ops.push(StoreOp::KeyValueOp(
-                DatabasePubkey(pubkey).as_kv_store_op(DatabasePubkey::key_for_index(i)),
-            ));
-
-            self.pubkeys.push(
-                (&pubkey)
+        } else {
+            // Sequential path for incremental updates
+            for pubkey_bytes in validator_keys {
+                let pubkey = (&pubkey_bytes)
                     .try_into()
-                    .map_err(BeaconChainError::InvalidValidatorPubkeyBytes)?,
-            );
-            self.pubkey_bytes.push(pubkey);
-
-            self.indices.insert(pubkey, i);
+                    .map_err(BeaconChainError::InvalidValidatorPubkeyBytes)?;
+                insert_key(pubkey_bytes, pubkey)?;
+            }
         }
 
         Ok(store_ops)
@@ -166,7 +204,10 @@ impl<T: BeaconChainTypes> ValidatorPubkeyCache<T> {
 /// Wrapper for a public key stored in the database.
 ///
 /// Keyed by the validator index as `Hash256::from_low_u64_be(index)`.
-struct DatabasePubkey(PublicKeyBytes);
+#[derive(Encode, Decode)]
+pub struct DatabasePubkey {
+    pubkey: SmallVec<[u8; PUBLIC_KEY_UNCOMPRESSED_BYTES_LEN]>,
+}
 
 impl StoreItem for DatabasePubkey {
     fn db_column() -> DBColumn {
@@ -174,11 +215,11 @@ impl StoreItem for DatabasePubkey {
     }
 
     fn as_store_bytes(&self) -> Vec<u8> {
-        self.0.as_ssz_bytes()
+        self.as_ssz_bytes()
     }
 
     fn from_store_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
-        Ok(Self(PublicKeyBytes::from_ssz_bytes(bytes)?))
+        Ok(Self::from_ssz_bytes(bytes)?)
     }
 }
 
@@ -186,16 +227,30 @@ impl DatabasePubkey {
     fn key_for_index(index: usize) -> Hash256 {
         Hash256::from_low_u64_be(index as u64)
     }
+
+    pub fn from_pubkey(pubkey: &PublicKey) -> Self {
+        Self {
+            pubkey: pubkey.serialize_uncompressed().into(),
+        }
+    }
+
+    pub fn as_pubkey(&self) -> Result<(PublicKey, PublicKeyBytes), BeaconChainError> {
+        let pubkey = PublicKey::deserialize_uncompressed(&self.pubkey)
+            .map_err(BeaconChainError::InvalidValidatorPubkeyBytes)?;
+        let pubkey_bytes = pubkey.compress();
+        Ok((pubkey, pubkey_bytes))
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::test_utils::{BeaconChainHarness, EphemeralHarnessType};
-    use logging::test_logger;
+    use bls::Keypair;
+    use logging::create_test_tracing_subscriber;
     use std::sync::Arc;
     use store::HotColdDB;
-    use types::{BeaconState, EthSpec, Keypair, MainnetEthSpec};
+    use types::{EthSpec, MainnetEthSpec};
 
     type E = MainnetEthSpec;
     type T = EphemeralHarnessType<E>;
@@ -213,9 +268,8 @@ mod test {
     }
 
     fn get_store() -> BeaconStore<T> {
-        Arc::new(
-            HotColdDB::open_ephemeral(<_>::default(), E::default_spec(), test_logger()).unwrap(),
-        )
+        create_test_tracing_subscriber();
+        Arc::new(HotColdDB::open_ephemeral(<_>::default(), Arc::new(E::default_spec())).unwrap())
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -248,7 +302,8 @@ mod test {
 
     #[test]
     fn basic_operation() {
-        let (state, keypairs) = get_state(8);
+        // >= 32 validators required for Gloas genesis with MainnetEthSpec (32 slots/epoch).
+        let (state, keypairs) = get_state(32);
 
         let store = get_store();
 
@@ -257,21 +312,14 @@ mod test {
         check_cache_get(&cache, &keypairs[..]);
 
         // Try adding a state with the same number of keypairs.
-        let (state, keypairs) = get_state(8);
-        cache
-            .import_new_pubkeys(&state)
-            .expect("should import pubkeys");
-        check_cache_get(&cache, &keypairs[..]);
-
-        // Try adding a state with less keypairs.
-        let (state, _) = get_state(1);
+        let (state, keypairs) = get_state(32);
         cache
             .import_new_pubkeys(&state)
             .expect("should import pubkeys");
         check_cache_get(&cache, &keypairs[..]);
 
         // Try adding a state with more keypairs.
-        let (state, keypairs) = get_state(12);
+        let (state, keypairs) = get_state(48);
         cache
             .import_new_pubkeys(&state)
             .expect("should import pubkeys");
@@ -280,7 +328,7 @@ mod test {
 
     #[test]
     fn persistence() {
-        let (state, keypairs) = get_state(8);
+        let (state, keypairs) = get_state(32);
 
         let store = get_store();
 
@@ -295,16 +343,51 @@ mod test {
         check_cache_get(&cache, &keypairs[..]);
 
         // Add some more keypairs.
-        let (state, keypairs) = get_state(12);
+        let (state, keypairs) = get_state(48);
         let ops = cache
             .import_new_pubkeys(&state)
             .expect("should import pubkeys");
-        store.do_atomically(ops).unwrap();
+        store.do_atomically_with_block_and_blobs_cache(ops).unwrap();
         check_cache_get(&cache, &keypairs[..]);
         drop(cache);
 
         // Re-init the cache from the store.
         let cache = ValidatorPubkeyCache::load_from_store(store).expect("should open cache");
         check_cache_get(&cache, &keypairs[..]);
+    }
+
+    #[test]
+    fn parallel_import_maintains_order() {
+        // Test that parallel decompression on first startup maintains correct order and indices
+        let (state, keypairs) = get_state(100);
+        let store = get_store();
+
+        // Create cache from empty state (triggers parallel path)
+        let cache: ValidatorPubkeyCache<T> =
+            ValidatorPubkeyCache::new(&state, store).expect("should create cache");
+
+        check_cache_get(&cache, &keypairs[..]);
+    }
+
+    #[test]
+    fn incremental_import_maintains_order() {
+        // Test that incremental imports maintain correct order (triggers sequential path)
+        let store = get_store();
+
+        // Start with 50 validators
+        let (state1, keypairs1) = get_state(50);
+        let mut cache =
+            ValidatorPubkeyCache::new(&state1, store.clone()).expect("should create cache");
+        check_cache_get(&cache, &keypairs1[..]);
+
+        // Add 50 more validators
+        let (state2, keypairs2) = get_state(100);
+        let ops = cache
+            .import_new_pubkeys(&state2)
+            .expect("should import pubkeys");
+        store.do_atomically_with_block_and_blobs_cache(ops).unwrap();
+
+        // Verify all 100 validators are correctly indexed
+        check_cache_get(&cache, &keypairs2[..]);
     }
 }

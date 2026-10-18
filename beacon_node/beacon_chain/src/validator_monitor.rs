@@ -2,24 +2,35 @@
 //!
 //! This component should not affect consensus.
 
+use crate::beacon_proposer_cache::{BeaconProposerCache, TYPICAL_SLOTS_PER_EPOCH};
 use crate::metrics;
-use parking_lot::RwLock;
-use slog::{crit, debug, info, Logger};
+use bls::PublicKeyBytes;
+use itertools::Itertools;
+use logging::crit;
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use slot_clock::SlotClock;
+use smallvec::SmallVec;
+use state_processing::common::get_attestation_participation_flag_indices;
 use state_processing::per_epoch_processing::{
-    errors::EpochProcessingError, EpochProcessingSummary,
+    EpochProcessingSummary, errors::EpochProcessingError,
 };
 use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
 use std::io;
 use std::marker::PhantomData;
 use std::str::Utf8Error;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 use store::AbstractExecPayload;
+use tracing::{debug, error, info, warn};
+use types::consts::altair::{
+    TIMELY_HEAD_FLAG_INDEX, TIMELY_SOURCE_FLAG_INDEX, TIMELY_TARGET_FLAG_INDEX,
+};
 use types::{
-    AttesterSlashing, BeaconBlockRef, BeaconState, ChainSpec, Epoch, EthSpec, Hash256,
-    IndexedAttestation, ProposerSlashing, PublicKeyBytes, SignedAggregateAndProof,
-    SignedContributionAndProof, Slot, SyncCommitteeMessage, VoluntaryExit,
+    Attestation, AttestationData, AttesterSlashingRef, BeaconBlockRef, BeaconState,
+    BeaconStateError, ChainSpec, Epoch, EthSpec, Hash256, IndexedAttestation,
+    IndexedAttestationRef, ProposerSlashing, SignedAggregateAndProof, SignedContributionAndProof,
+    Slot, SyncCommitteeMessage, VoluntaryExit,
 };
 
 /// Used for Prometheus labels.
@@ -35,7 +46,43 @@ pub const HISTORIC_EPOCHS: usize = 10;
 /// Once the validator monitor reaches this number of validators it will stop
 /// tracking their metrics/logging individually in an effort to reduce
 /// Prometheus cardinality and log volume.
-pub const DEFAULT_INDIVIDUAL_TRACKING_THRESHOLD: usize = 64;
+const DEFAULT_INDIVIDUAL_TRACKING_THRESHOLD: usize = 64;
+
+/// Lag slots used in detecting missed blocks for the monitored validators
+pub const MISSED_BLOCK_LAG_SLOTS: usize = 4;
+
+/// The number of epochs to look back when determining if a validator has missed a block. This value is used with
+/// the beacon_proposer_cache to determine if a validator has missed a block.
+/// And so, setting this value to anything higher than 1 is likely going to be problematic because the beacon_proposer_cache
+/// is only populated for the current and the previous epoch.
+pub const MISSED_BLOCK_LOOKBACK_EPOCHS: u64 = 1;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+// Initial configuration values for the `ValidatorMonitor`.
+pub struct ValidatorMonitorConfig {
+    pub auto_register: bool,
+    pub validators: Vec<PublicKeyBytes>,
+    pub individual_tracking_threshold: usize,
+}
+
+impl Default for ValidatorMonitorConfig {
+    fn default() -> Self {
+        Self {
+            auto_register: false,
+            validators: vec![],
+            individual_tracking_threshold: DEFAULT_INDIVIDUAL_TRACKING_THRESHOLD,
+        }
+    }
+}
+
+/// The goal is to check the behaviour of the BN if it pretends to attest at each slot
+/// Check the head/target/source once the state.slot is some slots beyond attestation.data.slot
+/// to defend against re-orgs. 16 slots is the minimum to defend against re-orgs of up to 16 slots.
+pub const UNAGGREGATED_ATTESTATION_LAG_SLOTS: usize = 16;
+
+/// Bound the storage size of simulated attestations. The head state can only verify attestations
+/// from the current and previous epoch.
+pub const MAX_UNAGGREGATED_ATTESTATION_HASHMAP_LENGTH: usize = 64;
 
 #[derive(Debug)]
 pub enum Error {
@@ -118,7 +165,7 @@ impl EpochSummary {
     /// - It is `None`.
     /// - `new` is greater than its current value.
     fn update_if_lt<T: Ord>(current: &mut Option<T>, new: T) {
-        if let Some(ref mut current) = current {
+        if let Some(current) = current {
             if new < *current {
                 *current = new
             }
@@ -297,7 +344,7 @@ impl MonitoredValidator {
 
         // Prune
         while summaries.len() > HISTORIC_EPOCHS {
-            if let Some(key) = summaries.iter().map(|(epoch, _)| *epoch).min() {
+            if let Some(key) = summaries.keys().copied().min() {
                 summaries.remove(&key);
             }
         }
@@ -323,6 +370,13 @@ impl MonitoredValidator {
     }
 }
 
+#[derive(PartialEq, Hash, Eq)]
+struct MissedBlock {
+    slot: Slot,
+    parent_root: Hash256,
+    validator_index: u64,
+}
+
 /// Holds a collection of `MonitoredValidator` and is notified about a variety of events on the P2P
 /// network, HTTP API and `BeaconChain`.
 ///
@@ -331,7 +385,7 @@ impl MonitoredValidator {
 ///
 /// The intention of this struct is to provide users with more logging and Prometheus metrics around
 /// validators that they are interested in.
-pub struct ValidatorMonitor<T> {
+pub struct ValidatorMonitor<E: EthSpec> {
     /// The validators that require additional monitoring.
     validators: HashMap<PublicKeyBytes, MonitoredValidator>,
     /// A map of validator index (state.validators) to a validator public key.
@@ -343,26 +397,37 @@ pub struct ValidatorMonitor<T> {
     /// large validator counts causing infeasibly high cardinailty for
     /// Prometheus and high log volumes.
     individual_tracking_threshold: usize,
-    log: Logger,
-    _phantom: PhantomData<T>,
+    /// A Map representing the (non-finalized) missed blocks by epoch, validator_index(state.validators) and slot
+    missed_blocks: HashSet<MissedBlock>,
+    // A beacon proposer cache
+    beacon_proposer_cache: Arc<Mutex<BeaconProposerCache>>,
+    // Unaggregated attestations generated by the committee index at each slot.
+    unaggregated_attestations: HashMap<Slot, Attestation<E>>,
+    _phantom: PhantomData<E>,
 }
 
-impl<T: EthSpec> ValidatorMonitor<T> {
+impl<E: EthSpec> ValidatorMonitor<E> {
     pub fn new(
-        pubkeys: Vec<PublicKeyBytes>,
-        auto_register: bool,
-        individual_tracking_threshold: usize,
-        log: Logger,
+        config: ValidatorMonitorConfig,
+        beacon_proposer_cache: Arc<Mutex<BeaconProposerCache>>,
     ) -> Self {
+        let ValidatorMonitorConfig {
+            auto_register,
+            validators,
+            individual_tracking_threshold,
+        } = config;
+
         let mut s = Self {
             validators: <_>::default(),
             indices: <_>::default(),
             auto_register,
             individual_tracking_threshold,
-            log,
+            missed_blocks: <_>::default(),
+            beacon_proposer_cache,
+            unaggregated_attestations: <_>::default(),
             _phantom: PhantomData,
         };
-        for pubkey in pubkeys {
+        for pubkey in validators {
             s.add_validator_pubkey(pubkey)
         }
         s
@@ -376,27 +441,49 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     }
 
     /// Add some validators to `self` for additional monitoring.
-    fn add_validator_pubkey(&mut self, pubkey: PublicKeyBytes) {
+    pub fn add_validator_pubkey(&mut self, pubkey: PublicKeyBytes) {
         let index_opt = self
             .indices
             .iter()
             .find(|(_, candidate_pk)| **candidate_pk == pubkey)
             .map(|(index, _)| *index);
 
-        let log = self.log.clone();
         self.validators.entry(pubkey).or_insert_with(|| {
             info!(
-                log,
-                "Started monitoring validator";
-                "pubkey" => %pubkey,
+                %pubkey,
+                "Started monitoring validator"
             );
             MonitoredValidator::new(pubkey, index_opt)
         });
     }
 
+    /// Add an unaggregated attestation
+    pub fn set_unaggregated_attestation(&mut self, attestation: Attestation<E>) {
+        let unaggregated_attestations = &mut self.unaggregated_attestations;
+
+        // Pruning, this removes the oldest key/pair of the hashmap if it's greater than MAX_UNAGGREGATED_ATTESTATION_HASHMAP_LENGTH
+        if unaggregated_attestations.len() >= MAX_UNAGGREGATED_ATTESTATION_HASHMAP_LENGTH
+            && let Some(oldest_slot) = unaggregated_attestations.keys().min().copied()
+        {
+            unaggregated_attestations.remove(&oldest_slot);
+        }
+
+        let slot = attestation.data().slot;
+        self.unaggregated_attestations.insert(slot, attestation);
+    }
+
+    pub fn get_unaggregated_attestation(&self, slot: Slot) -> Option<&Attestation<E>> {
+        self.unaggregated_attestations.get(&slot)
+    }
+
     /// Reads information from the given `state`. The `state` *must* be valid (i.e, able to be
     /// imported).
-    pub fn process_valid_state(&mut self, current_epoch: Epoch, state: &BeaconState<T>) {
+    pub fn process_valid_state(
+        &mut self,
+        current_epoch: Epoch,
+        state: &BeaconState<E>,
+        spec: &ChainSpec,
+    ) {
         // Add any new validator indices.
         state
             .validators()
@@ -410,6 +497,10 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                 }
                 self.indices.insert(i, validator.pubkey);
             });
+
+        // Add missed non-finalized blocks for the monitored validators
+        self.add_validators_missed_blocks(state, spec);
+        self.process_unaggregated_attestations(state, spec);
 
         // Update metrics for individual validators.
         for monitored_validator in self.validators.values() {
@@ -489,6 +580,185 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                 }
             }
         }
+
+        // Prune missed blocks that are prior to last finalized epochs - MISSED_BLOCK_LOOKBACK_EPOCHS
+        let finalized_epoch = state.finalized_checkpoint().epoch;
+        self.missed_blocks.retain(|missed_block| {
+            let epoch = missed_block.slot.epoch(E::slots_per_epoch());
+            epoch + Epoch::new(MISSED_BLOCK_LOOKBACK_EPOCHS) >= finalized_epoch
+        });
+    }
+
+    /// Add missed non-finalized blocks for the monitored validators
+    fn add_validators_missed_blocks(&mut self, state: &BeaconState<E>, spec: &ChainSpec) {
+        // Define range variables
+        let current_slot = state.slot();
+        let current_epoch = current_slot.epoch(E::slots_per_epoch());
+        // start_slot needs to be coherent with what can be retrieved from the beacon_proposer_cache
+        let start_slot = current_epoch.start_slot(E::slots_per_epoch())
+            - Slot::new(MISSED_BLOCK_LOOKBACK_EPOCHS * E::slots_per_epoch());
+
+        let end_slot = current_slot.saturating_sub(MISSED_BLOCK_LAG_SLOTS).as_u64();
+
+        // List of proposers per epoch from the beacon_proposer_cache, and the epoch at which the
+        // cache is valid.
+        let mut proposers_per_epoch: Option<(SmallVec<[usize; TYPICAL_SLOTS_PER_EPOCH]>, Epoch)> =
+            None;
+
+        for (prev_slot, slot) in (start_slot.as_u64()..=end_slot)
+            .map(Slot::new)
+            .tuple_windows()
+        {
+            // Condition for missed_block is defined such as block_root(slot) == block_root(slot - 1)
+            // where the proposer who missed the block is the proposer of the block at block_root(slot)
+            if let (Ok(block_root), Ok(prev_block_root)) =
+                (state.get_block_root(slot), state.get_block_root(prev_slot))
+            {
+                // Found missed block
+                if block_root == prev_block_root {
+                    let slot_epoch = slot.epoch(E::slots_per_epoch());
+
+                    if let Ok(shuffling_decision_block) = state
+                        .proposer_shuffling_decision_root_at_epoch(slot_epoch, *block_root, spec)
+                    {
+                        // Update the cache if it has not yet been initialised, or if it is
+                        // initialised for a prior epoch. This is an optimisation to avoid bouncing
+                        // the proposer shuffling cache lock when there are lots of missed blocks.
+                        if proposers_per_epoch
+                            .as_ref()
+                            .is_none_or(|(_, cached_epoch)| *cached_epoch != slot_epoch)
+                        {
+                            proposers_per_epoch = self
+                                .get_proposers_by_epoch_from_cache(
+                                    slot_epoch,
+                                    shuffling_decision_block,
+                                )
+                                .map(|cache| (cache, slot_epoch));
+                        }
+
+                        // Only add missed blocks for the proposer if it's in the list of monitored validators
+                        let slot_in_epoch = slot % E::slots_per_epoch();
+                        if let Some(proposer_index) = proposers_per_epoch
+                            .as_ref()
+                            .and_then(|(proposers, _)| proposers.get(slot_in_epoch.as_usize()))
+                        {
+                            let i = *proposer_index as u64;
+                            if let Some(pub_key) = self.indices.get(&i) {
+                                if let Some(validator) = self.validators.get(pub_key) {
+                                    let missed_block = MissedBlock {
+                                        slot,
+                                        parent_root: *prev_block_root,
+                                        validator_index: i,
+                                    };
+                                    // Incr missed block counter for the validator only if it doesn't already exist in the hashset
+                                    if self.missed_blocks.insert(missed_block) {
+                                        self.aggregatable_metric(&validator.id, |label| {
+                                            metrics::inc_counter_vec(
+                                                &metrics::VALIDATOR_MONITOR_MISSED_BLOCKS_TOTAL,
+                                                &[label],
+                                            );
+                                        });
+                                        error!(
+                                            index = i,
+                                            %slot,
+                                            ?prev_block_root,
+                                            "Validator missed a block"
+                                        );
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    info = "potentially inconsistency in the validator manager",
+                                    index = i,
+                                    "Missing validator index"
+                                )
+                            }
+                        } else {
+                            debug!(
+                                epoch = ?slot_epoch,
+                                decision_root = ?shuffling_decision_block,
+                                "Could not get proposers from cache"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_proposers_by_epoch_from_cache(
+        &mut self,
+        epoch: Epoch,
+        shuffling_decision_block: Hash256,
+    ) -> Option<SmallVec<[usize; TYPICAL_SLOTS_PER_EPOCH]>> {
+        let mut cache = self.beacon_proposer_cache.lock();
+        cache
+            .get_epoch::<E>(shuffling_decision_block, epoch)
+            .cloned()
+    }
+
+    /// Process the unaggregated attestations generated by the service `attestation_simulator_service`
+    /// and check if the attestation qualifies for a reward matching the flags source/target/head
+    fn process_unaggregated_attestations(&mut self, state: &BeaconState<E>, spec: &ChainSpec) {
+        let current_slot = state.slot();
+
+        // Ensures that we process attestation when there have been skipped slots between blocks
+        let attested_slots: Vec<_> = self
+            .unaggregated_attestations
+            .keys()
+            .filter(|&&attestation_slot| {
+                attestation_slot
+                    < current_slot - Slot::new(UNAGGREGATED_ATTESTATION_LAG_SLOTS as u64)
+            })
+            .cloned()
+            .collect();
+
+        let unaggregated_attestations = &mut self.unaggregated_attestations;
+        for slot in attested_slots {
+            if let Some(unaggregated_attestation) = unaggregated_attestations.remove(&slot) {
+                // Don't process this attestation, it's too old to be processed by this state.
+                if slot.epoch(E::slots_per_epoch()) < state.previous_epoch() {
+                    continue;
+                }
+
+                // We are simulating that unaggregated attestation in a service that produces unaggregated attestations
+                // every slot, the inclusion_delay shouldn't matter here as long as the minimum value
+                // that qualifies the committee index for reward is included
+                let inclusion_delay = spec.min_attestation_inclusion_delay;
+
+                let data = unaggregated_attestation.data();
+
+                // Get the reward indices for the unaggregated attestation or log an error
+                match get_attestation_participation_flag_indices(
+                    state,
+                    unaggregated_attestation.data(),
+                    inclusion_delay,
+                    spec,
+                ) {
+                    Ok(flag_indices) => {
+                        let head_hit = flag_indices.contains(&TIMELY_HEAD_FLAG_INDEX);
+                        let target_hit = flag_indices.contains(&TIMELY_TARGET_FLAG_INDEX);
+                        let source_hit = flag_indices.contains(&TIMELY_SOURCE_FLAG_INDEX);
+                        register_simulated_attestation(data, head_hit, target_hit, source_hit)
+                    }
+                    Err(BeaconStateError::IncorrectAttestationSource) => {
+                        register_simulated_attestation(data, false, false, false)
+                    }
+                    Err(err) => {
+                        error!(
+                            error = ?err,
+                            ?unaggregated_attestation,
+                            "Failed to get attestation participation flag indices"
+                        );
+                    }
+                }
+            } else {
+                error!(
+                    ?slot,
+                    "Failed to remove unaggregated attestation from the hashmap"
+                );
+            }
+        }
     }
 
     /// Run `func` with the `TOTAL_LABEL` and optionally the
@@ -512,7 +782,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     pub fn process_validator_statuses(
         &self,
         epoch: Epoch,
-        summary: &EpochProcessingSummary<T>,
+        summary: &EpochProcessingSummary<E>,
         spec: &ChainSpec,
     ) -> Result<(), EpochProcessingError> {
         let mut attestation_success = Vec::new();
@@ -588,13 +858,12 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                     attestation_success.push(id);
                     if self.individual_tracking() {
                         debug!(
-                            self.log,
-                            "Previous epoch attestation success";
-                            "matched_source" => previous_epoch_matched_source,
-                            "matched_target" => previous_epoch_matched_target,
-                            "matched_head" => previous_epoch_matched_head,
-                            "epoch" => prev_epoch,
-                            "validator" => id,
+                            matched_source = previous_epoch_matched_source,
+                            matched_target = previous_epoch_matched_target,
+                            matched_head = previous_epoch_matched_head,
+                            epoch = %prev_epoch,
+                            validator = id,
+                            "Previous epoch attestation success"
                         )
                     }
                 } else {
@@ -607,10 +876,9 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                     attestation_miss.push(id);
                     if self.individual_tracking() {
                         debug!(
-                            self.log,
-                            "Previous epoch attestation missing";
-                            "epoch" => prev_epoch,
-                            "validator" => id,
+                            epoch = %prev_epoch,
+                            validator = id,
+                            "Previous epoch attestation missing"
                         )
                     }
                 }
@@ -633,10 +901,9 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                     head_miss.push(id);
                     if self.individual_tracking() {
                         debug!(
-                            self.log,
-                            "Attestation failed to match head";
-                            "epoch" => prev_epoch,
-                            "validator" => id,
+                            epoch = %prev_epoch,
+                            validator = id,
+                            "Attestation failed to match head"
                         );
                     }
                 }
@@ -659,10 +926,9 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                     target_miss.push(id);
                     if self.individual_tracking() {
                         debug!(
-                            self.log,
-                            "Attestation failed to match target";
-                            "epoch" => prev_epoch,
-                            "validator" => id,
+                            epoch = %prev_epoch,
+                            validator = id,
+                            "Attestation failed to match target"
                         );
                     }
                 }
@@ -681,12 +947,11 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                         suboptimal_inclusion.push(id);
                         if self.individual_tracking() {
                             debug!(
-                                self.log,
-                                "Potential sub-optimal inclusion delay";
-                                "optimal" => spec.min_attestation_inclusion_delay,
-                                "delay" => inclusion_delay,
-                                "epoch" => prev_epoch,
-                                "validator" => id,
+                                optimal = spec.min_attestation_inclusion_delay,
+                                delay = inclusion_delay,
+                                epoch = %prev_epoch,
+                                validator = id,
+                                "Potential sub-optimal inclusion delay"
                             );
                         }
                     }
@@ -724,12 +989,11 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                             // logs that can be generated is capped by the size
                             // of the sync committee.
                             info!(
-                                self.log,
-                                "Current epoch sync signatures";
-                                "included" => summary.sync_signature_block_inclusions,
-                                "expected" => T::slots_per_epoch(),
-                                "epoch" => current_epoch,
-                                "validator" => id,
+                                included = summary.sync_signature_block_inclusions,
+                                expected = E::slots_per_epoch(),
+                                epoch = %current_epoch,
+                                validator = id,
+                                "Current epoch sync signatures"
                             );
                         }
                     } else if self.individual_tracking() {
@@ -739,10 +1003,9 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                             0,
                         );
                         debug!(
-                            self.log,
-                            "Validator isn't part of the current sync committee";
-                            "epoch" => current_epoch,
-                            "validator" => id,
+                            epoch = %current_epoch,
+                            validator = id,
+                            "Validator isn't part of the current sync committee"
                         );
                     }
                 }
@@ -753,45 +1016,40 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         // for all validators managed by the validator monitor.
         if !attestation_success.is_empty() {
             info!(
-                self.log,
-                "Previous epoch attestation(s) success";
-                "epoch" => prev_epoch,
-                "validators" => ?attestation_success,
+                epoch = %prev_epoch,
+                validators = ?attestation_success,
+                "Previous epoch attestation(s) success"
             );
         }
         if !attestation_miss.is_empty() {
             info!(
-                self.log,
-                "Previous epoch attestation(s) missing";
-                "epoch" => prev_epoch,
-                "validators" => ?attestation_miss,
+                epoch = %prev_epoch,
+                validators = ?attestation_miss,
+                "Previous epoch attestation(s) missing"
             );
         }
 
         if !head_miss.is_empty() {
             info!(
-                self.log,
-                "Previous epoch attestation(s) failed to match head";
-                "epoch" => prev_epoch,
-                "validators" => ?head_miss,
+                epoch = %prev_epoch,
+                validators = ?head_miss,
+                "Previous epoch attestation(s) failed to match head"
             );
         }
 
         if !target_miss.is_empty() {
             info!(
-                self.log,
-                "Previous epoch attestation(s) failed to match target";
-                "epoch" => prev_epoch,
-                "validators" => ?target_miss,
+                epoch = %prev_epoch,
+                validators = ?target_miss,
+                "Previous epoch attestation(s) failed to match target"
             );
         }
 
         if !suboptimal_inclusion.is_empty() {
             info!(
-                self.log,
-                "Previous epoch attestation(s) had sub-optimal inclusion delay";
-                "epoch" => prev_epoch,
-                "validators" => ?suboptimal_inclusion,
+                epoch = %prev_epoch,
+                validators = ?suboptimal_inclusion,
+                "Previous epoch attestation(s) had sub-optimal inclusion delay"
             );
         }
 
@@ -809,7 +1067,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         self.validators.len()
     }
 
-    // Return the `id`'s of all monitored validators.
+    /// Return the `id`'s of all monitored validators.
     pub fn get_all_monitored_validators(&self) -> Vec<String> {
         self.validators.values().map(|val| val.id.clone()).collect()
     }
@@ -822,6 +1080,17 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         }
     }
 
+    pub fn get_monitored_validator_missed_block_count(&self, validator_index: u64) -> u64 {
+        self.missed_blocks
+            .iter()
+            .filter(|missed_block| missed_block.validator_index == validator_index)
+            .count() as u64
+    }
+
+    pub fn get_beacon_proposer_cache(&self) -> Arc<Mutex<BeaconProposerCache>> {
+        self.beacon_proposer_cache.clone()
+    }
+
     /// If `self.auto_register == true`, add the `validator_index` to `self.monitored_validators`.
     /// Otherwise, do nothing.
     pub fn auto_register_local_validator(&mut self, validator_index: u64) {
@@ -829,20 +1098,19 @@ impl<T: EthSpec> ValidatorMonitor<T> {
             return;
         }
 
-        if let Some(pubkey) = self.indices.get(&validator_index) {
-            if !self.validators.contains_key(pubkey) {
-                info!(
-                    self.log,
-                    "Started monitoring validator";
-                    "pubkey" => %pubkey,
-                    "validator" => %validator_index,
-                );
+        if let Some(pubkey) = self.indices.get(&validator_index)
+            && !self.validators.contains_key(pubkey)
+        {
+            info!(
+                %pubkey,
+                validator = %validator_index,
+                "Started monitoring validator"
+            );
 
-                self.validators.insert(
-                    *pubkey,
-                    MonitoredValidator::new(*pubkey, Some(validator_index)),
-                );
-            }
+            self.validators.insert(
+                *pubkey,
+                MonitoredValidator::new(*pubkey, Some(validator_index)),
+            );
         }
     }
 
@@ -850,7 +1118,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     pub fn register_gossip_block<S: SlotClock>(
         &self,
         seen_timestamp: Duration,
-        block: BeaconBlockRef<'_, T>,
+        block: BeaconBlockRef<'_, E>,
         block_root: Hash256,
         slot_clock: &S,
     ) {
@@ -861,7 +1129,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     pub fn register_api_block<S: SlotClock>(
         &self,
         seen_timestamp: Duration,
-        block: BeaconBlockRef<'_, T>,
+        block: BeaconBlockRef<'_, E>,
         block_root: Hash256,
         slot_clock: &S,
     ) {
@@ -872,11 +1140,11 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         &self,
         src: &str,
         seen_timestamp: Duration,
-        block: BeaconBlockRef<'_, T>,
+        block: BeaconBlockRef<'_, E>,
         block_root: Hash256,
         slot_clock: &S,
     ) {
-        let epoch = block.slot().epoch(T::slots_per_epoch());
+        let epoch = block.slot().epoch(E::slots_per_epoch());
         if let Some(validator) = self.get_validator(block.proposer_index()) {
             let id = &validator.id;
             let delay = get_block_delay_ms(seen_timestamp, block, slot_clock);
@@ -894,13 +1162,12 @@ impl<T: EthSpec> ValidatorMonitor<T> {
             });
 
             info!(
-                self.log,
-                "Block from API";
-                "root" => ?block_root,
-                "delay" => %delay.as_millis(),
-                "slot" => %block.slot(),
-                "src" => src,
-                "validator" => %id,
+                ?block_root,
+                delay = %delay.as_millis(),
+                slot = %block.slot(),
+                src,
+                validator = %id,
+                "Block from monitored validator"
             );
 
             validator.with_epoch_summary(epoch, |summary| summary.register_block(delay));
@@ -911,7 +1178,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     pub fn register_gossip_unaggregated_attestation<S: SlotClock>(
         &self,
         seen_timestamp: Duration,
-        indexed_attestation: &IndexedAttestation<T>,
+        indexed_attestation: &IndexedAttestation<E>,
         slot_clock: &S,
     ) {
         self.register_unaggregated_attestation(
@@ -926,7 +1193,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     pub fn register_api_unaggregated_attestation<S: SlotClock>(
         &self,
         seen_timestamp: Duration,
-        indexed_attestation: &IndexedAttestation<T>,
+        indexed_attestation: &IndexedAttestation<E>,
         slot_clock: &S,
     ) {
         self.register_unaggregated_attestation(
@@ -941,19 +1208,19 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         &self,
         src: &str,
         seen_timestamp: Duration,
-        indexed_attestation: &IndexedAttestation<T>,
+        indexed_attestation: &IndexedAttestation<E>,
         slot_clock: &S,
     ) {
-        let data = &indexed_attestation.data;
-        let epoch = data.slot.epoch(T::slots_per_epoch());
+        let data = indexed_attestation.data();
+        let epoch = data.slot.epoch(E::slots_per_epoch());
         let delay = get_message_delay_ms(
             seen_timestamp,
             data.slot,
-            slot_clock.unagg_attestation_production_delay(),
+            Duration::from_secs(0),
             slot_clock,
         );
 
-        indexed_attestation.attesting_indices.iter().for_each(|i| {
+        indexed_attestation.attesting_indices_iter().for_each(|i| {
             if let Some(validator) = self.get_validator(*i) {
                 let id = &validator.id;
 
@@ -971,15 +1238,14 @@ impl<T: EthSpec> ValidatorMonitor<T> {
 
                 if self.individual_tracking() {
                     info!(
-                        self.log,
-                        "Unaggregated attestation";
-                        "head" => ?data.beacon_block_root,
-                        "index" => %data.index,
-                        "delay_ms" => %delay.as_millis(),
-                        "epoch" => %epoch,
-                        "slot" => %data.slot,
-                        "src" => src,
-                        "validator" => %id,
+                        head = ?data.beacon_block_root,
+                        index = %data.index,
+                        delay_ms = %delay.as_millis(),
+                        %epoch,
+                        slot = %data.slot,
+                        src,
+                        validator = %id,
+                        "Unaggregated attestation"
                     );
                 }
 
@@ -994,9 +1260,10 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     pub fn register_gossip_aggregated_attestation<S: SlotClock>(
         &self,
         seen_timestamp: Duration,
-        signed_aggregate_and_proof: &SignedAggregateAndProof<T>,
-        indexed_attestation: &IndexedAttestation<T>,
+        signed_aggregate_and_proof: &SignedAggregateAndProof<E>,
+        indexed_attestation: &IndexedAttestation<E>,
         slot_clock: &S,
+        spec: &ChainSpec,
     ) {
         self.register_aggregated_attestation(
             "gossip",
@@ -1004,6 +1271,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
             signed_aggregate_and_proof,
             indexed_attestation,
             slot_clock,
+            spec,
         )
     }
 
@@ -1011,9 +1279,10 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     pub fn register_api_aggregated_attestation<S: SlotClock>(
         &self,
         seen_timestamp: Duration,
-        signed_aggregate_and_proof: &SignedAggregateAndProof<T>,
-        indexed_attestation: &IndexedAttestation<T>,
+        signed_aggregate_and_proof: &SignedAggregateAndProof<E>,
+        indexed_attestation: &IndexedAttestation<E>,
         slot_clock: &S,
+        spec: &ChainSpec,
     ) {
         self.register_aggregated_attestation(
             "api",
@@ -1021,6 +1290,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
             signed_aggregate_and_proof,
             indexed_attestation,
             slot_clock,
+            spec,
         )
     }
 
@@ -1028,20 +1298,21 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         &self,
         src: &str,
         seen_timestamp: Duration,
-        signed_aggregate_and_proof: &SignedAggregateAndProof<T>,
-        indexed_attestation: &IndexedAttestation<T>,
+        signed_aggregate_and_proof: &SignedAggregateAndProof<E>,
+        indexed_attestation: &IndexedAttestation<E>,
         slot_clock: &S,
+        spec: &ChainSpec,
     ) {
-        let data = &indexed_attestation.data;
-        let epoch = data.slot.epoch(T::slots_per_epoch());
+        let data = indexed_attestation.data();
+        let epoch = data.slot.epoch(E::slots_per_epoch());
         let delay = get_message_delay_ms(
             seen_timestamp,
             data.slot,
-            slot_clock.agg_attestation_production_delay(),
+            spec.get_aggregate_attestation_due(),
             slot_clock,
         );
 
-        let aggregator_index = signed_aggregate_and_proof.message.aggregator_index;
+        let aggregator_index = signed_aggregate_and_proof.message().aggregator_index();
         if let Some(validator) = self.get_validator(aggregator_index) {
             let id = &validator.id;
 
@@ -1059,15 +1330,14 @@ impl<T: EthSpec> ValidatorMonitor<T> {
 
             if self.individual_tracking() {
                 info!(
-                    self.log,
-                    "Aggregated attestation";
-                    "head" => ?data.beacon_block_root,
-                    "index" => %data.index,
-                    "delay_ms" => %delay.as_millis(),
-                    "epoch" => %epoch,
-                    "slot" => %data.slot,
-                    "src" => src,
-                    "validator" => %id,
+                    head = ?data.beacon_block_root,
+                    index = %data.index,
+                    delay_ms = %delay.as_millis(),
+                    %epoch,
+                    slot = %data.slot,
+                    src,
+                    validator = %id,
+                    "Aggregated attestation"
                 );
             }
 
@@ -1076,7 +1346,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
             });
         }
 
-        indexed_attestation.attesting_indices.iter().for_each(|i| {
+        indexed_attestation.attesting_indices_iter().for_each(|i| {
             if let Some(validator) = self.get_validator(*i) {
                 let id = &validator.id;
 
@@ -1093,17 +1363,41 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                 });
 
                 if self.individual_tracking() {
-                    info!(
-                        self.log,
-                        "Attestation included in aggregate";
-                        "head" => ?data.beacon_block_root,
-                        "index" => %data.index,
-                        "delay_ms" => %delay.as_millis(),
-                        "epoch" => %epoch,
-                        "slot" => %data.slot,
-                        "src" => src,
-                        "validator" => %id,
-                    );
+                    let is_first_inclusion_aggregate = validator
+                        .get_from_epoch_summary(epoch, |summary_opt| {
+                            if let Some(summary) = summary_opt {
+                                Some(summary.attestation_aggregate_inclusions == 0)
+                            } else {
+                                // No data for this validator: no inclusion.
+                                Some(true)
+                            }
+                        })
+                        .unwrap_or(true);
+
+                    if is_first_inclusion_aggregate {
+                        info!(
+                            head = ?data.beacon_block_root,
+                            index = %data.index,
+                            delay_ms = %delay.as_millis(),
+                            %epoch,
+                            slot = %data.slot,
+                            src,
+                            validator = %id,
+                            "Attestation included in aggregate"
+                        );
+                    } else {
+                        // Downgrade to Debug for second and onwards of logging to reduce verbosity
+                        debug!(
+                            head = ?data.beacon_block_root,
+                            index = %data.index,
+                            delay_ms = %delay.as_millis(),
+                            %epoch,
+                            slot = %data.slot,
+                            src,
+                            validator = %id,
+                            "Attestation included in aggregate"
+                        )
+                    };
                 }
 
                 validator.with_epoch_summary(epoch, |summary| {
@@ -1121,20 +1415,20 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     /// Note: Blocks that get orphaned will skew the inclusion distance calculation.
     pub fn register_attestation_in_block(
         &self,
-        indexed_attestation: &IndexedAttestation<T>,
+        indexed_attestation: IndexedAttestationRef<'_, E>,
         parent_slot: Slot,
         spec: &ChainSpec,
     ) {
-        let data = &indexed_attestation.data;
+        let data = indexed_attestation.data();
         // Best effort inclusion distance which ignores skip slots between the parent
         // and the current block. Skipped slots between the attestation slot and the parent
         // slot are still counted for simplicity's sake.
         let inclusion_distance = parent_slot.saturating_sub(data.slot) + 1;
 
         let delay = inclusion_distance - spec.min_attestation_inclusion_delay;
-        let epoch = data.slot.epoch(T::slots_per_epoch());
+        let epoch = data.slot.epoch(E::slots_per_epoch());
 
-        indexed_attestation.attesting_indices.iter().for_each(|i| {
+        indexed_attestation.attesting_indices_iter().for_each(|i| {
             if let Some(validator) = self.get_validator(*i) {
                 let id = &validator.id;
 
@@ -1144,7 +1438,6 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                         &["block", label],
                     );
                 });
-
                 if self.individual_tracking() {
                     metrics::set_int_gauge(
                         &metrics::VALIDATOR_MONITOR_ATTESTATION_IN_BLOCK_DELAY_SLOTS,
@@ -1152,16 +1445,39 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                         delay.as_u64() as i64,
                     );
 
-                    info!(
-                        self.log,
-                        "Attestation included in block";
-                        "head" => ?data.beacon_block_root,
-                        "index" => %data.index,
-                        "inclusion_lag" => format!("{} slot(s)", delay),
-                        "epoch" => %epoch,
-                        "slot" => %data.slot,
-                        "validator" => %id,
-                    );
+                    let is_first_inclusion_block = validator
+                        .get_from_epoch_summary(epoch, |summary_opt| {
+                            if let Some(summary) = summary_opt {
+                                Some(summary.attestation_block_inclusions == 0)
+                            } else {
+                                // No data for this validator: no inclusion.
+                                Some(true)
+                            }
+                        })
+                        .unwrap_or(true);
+
+                    if is_first_inclusion_block {
+                        info!(
+                            head = ?data.beacon_block_root,
+                            index = %data.index,
+                            inclusion_lag = format!("{} slot(s)", delay),
+                            %epoch,
+                            slot = %data.slot,
+                            validator = %id,
+                            "Attestation included in block"
+                        );
+                    } else {
+                        // Downgrade to Debug for second and onwards of logging to reduce verbosity
+                        debug!(
+                            head = ?data.beacon_block_root,
+                            index = %data.index,
+                            inclusion_lag = format!("{} slot(s)", delay),
+                            %epoch,
+                            slot = %data.slot,
+                            validator = %id,
+                            "Attestation included in block"
+                        );
+                    }
                 }
 
                 validator.with_epoch_summary(epoch, |summary| {
@@ -1177,12 +1493,14 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         seen_timestamp: Duration,
         sync_committee_message: &SyncCommitteeMessage,
         slot_clock: &S,
+        spec: &ChainSpec,
     ) {
         self.register_sync_committee_message(
             "gossip",
             seen_timestamp,
             sync_committee_message,
             slot_clock,
+            spec,
         )
     }
 
@@ -1192,12 +1510,14 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         seen_timestamp: Duration,
         sync_committee_message: &SyncCommitteeMessage,
         slot_clock: &S,
+        spec: &ChainSpec,
     ) {
         self.register_sync_committee_message(
             "api",
             seen_timestamp,
             sync_committee_message,
             slot_clock,
+            spec,
         )
     }
 
@@ -1208,15 +1528,15 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         seen_timestamp: Duration,
         sync_committee_message: &SyncCommitteeMessage,
         slot_clock: &S,
+        spec: &ChainSpec,
     ) {
         if let Some(validator) = self.get_validator(sync_committee_message.validator_index) {
             let id = &validator.id;
-
-            let epoch = sync_committee_message.slot.epoch(T::slots_per_epoch());
+            let epoch = sync_committee_message.slot.epoch(E::slots_per_epoch());
             let delay = get_message_delay_ms(
                 seen_timestamp,
                 sync_committee_message.slot,
-                slot_clock.sync_committee_message_production_delay(),
+                spec.get_sync_message_due(),
                 slot_clock,
             );
 
@@ -1234,14 +1554,13 @@ impl<T: EthSpec> ValidatorMonitor<T> {
 
             if self.individual_tracking() {
                 info!(
-                    self.log,
-                    "Sync committee message";
-                    "head" => %sync_committee_message.beacon_block_root,
-                    "delay_ms" => %delay.as_millis(),
-                    "epoch" => %epoch,
-                    "slot" => %sync_committee_message.slot,
-                    "src" => src,
-                    "validator" => %id,
+                    head = %sync_committee_message.beacon_block_root,
+                    delay_ms = %delay.as_millis(),
+                    %epoch,
+                    slot = %sync_committee_message.slot,
+                    src,
+                    validator = %id,
+                    "Sync committee message"
                 );
             }
 
@@ -1255,9 +1574,10 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     pub fn register_gossip_sync_committee_contribution<S: SlotClock>(
         &self,
         seen_timestamp: Duration,
-        sync_contribution: &SignedContributionAndProof<T>,
+        sync_contribution: &SignedContributionAndProof<E>,
         participant_pubkeys: &[PublicKeyBytes],
         slot_clock: &S,
+        spec: &ChainSpec,
     ) {
         self.register_sync_committee_contribution(
             "gossip",
@@ -1265,6 +1585,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
             sync_contribution,
             participant_pubkeys,
             slot_clock,
+            spec,
         )
     }
 
@@ -1272,9 +1593,10 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     pub fn register_api_sync_committee_contribution<S: SlotClock>(
         &self,
         seen_timestamp: Duration,
-        sync_contribution: &SignedContributionAndProof<T>,
+        sync_contribution: &SignedContributionAndProof<E>,
         participant_pubkeys: &[PublicKeyBytes],
         slot_clock: &S,
+        spec: &ChainSpec,
     ) {
         self.register_sync_committee_contribution(
             "api",
@@ -1282,6 +1604,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
             sync_contribution,
             participant_pubkeys,
             slot_clock,
+            spec,
         )
     }
 
@@ -1290,17 +1613,18 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         &self,
         src: &str,
         seen_timestamp: Duration,
-        sync_contribution: &SignedContributionAndProof<T>,
+        sync_contribution: &SignedContributionAndProof<E>,
         participant_pubkeys: &[PublicKeyBytes],
         slot_clock: &S,
+        spec: &ChainSpec,
     ) {
         let slot = sync_contribution.message.contribution.slot;
-        let epoch = slot.epoch(T::slots_per_epoch());
+        let epoch = slot.epoch(E::slots_per_epoch());
         let beacon_block_root = sync_contribution.message.contribution.beacon_block_root;
         let delay = get_message_delay_ms(
             seen_timestamp,
             slot,
-            slot_clock.sync_committee_contribution_production_delay(),
+            spec.get_contribution_message_due(),
             slot_clock,
         );
 
@@ -1322,14 +1646,13 @@ impl<T: EthSpec> ValidatorMonitor<T> {
 
             if self.individual_tracking() {
                 info!(
-                    self.log,
-                    "Sync contribution";
-                    "head" => %beacon_block_root,
-                    "delay_ms" => %delay.as_millis(),
-                    "epoch" => %epoch,
-                    "slot" => %slot,
-                    "src" => src,
-                    "validator" => %id,
+                    head = %beacon_block_root,
+                    delay_ms = %delay.as_millis(),
+                    %epoch,
+                    %slot,
+                    src,
+                    validator = %id,
+                    "Sync contribution"
                 );
             }
 
@@ -1351,14 +1674,13 @@ impl<T: EthSpec> ValidatorMonitor<T> {
 
                 if self.individual_tracking() {
                     info!(
-                        self.log,
-                        "Sync signature included in contribution";
-                        "head" => %beacon_block_root,
-                        "delay_ms" => %delay.as_millis(),
-                        "epoch" => %epoch,
-                        "slot" => %slot,
-                        "src" => src,
-                        "validator" => %id,
+                        head = %beacon_block_root,
+                        delay_ms = %delay.as_millis(),
+                        %epoch,
+                        %slot,
+                        src,
+                        validator = %id,
+                        "Sync signature included in contribution"
                     );
                 }
 
@@ -1376,7 +1698,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         beacon_block_root: Hash256,
         participant_pubkeys: Vec<&PublicKeyBytes>,
     ) {
-        let epoch = slot.epoch(T::slots_per_epoch());
+        let epoch = slot.epoch(E::slots_per_epoch());
 
         for validator_pubkey in participant_pubkeys {
             if let Some(validator) = self.validators.get(validator_pubkey) {
@@ -1391,12 +1713,11 @@ impl<T: EthSpec> ValidatorMonitor<T> {
 
                 if self.individual_tracking() {
                     info!(
-                        self.log,
-                        "Sync signature included in block";
-                        "head" => %beacon_block_root,
-                        "epoch" => %epoch,
-                        "slot" => %slot,
-                        "validator" => %id,
+                        head = %beacon_block_root,
+                        %epoch,
+                        %slot,
+                        validator = %id,
+                        "Sync signature included in block"
                     );
                 }
 
@@ -1434,11 +1755,10 @@ impl<T: EthSpec> ValidatorMonitor<T> {
             // Not gated behind `self.individual_tracking()` since it's an
             // infrequent and interesting message.
             info!(
-                self.log,
-                "Voluntary exit";
-                "epoch" => %epoch,
-                "validator" => %id,
-                "src" => src,
+                %epoch,
+                validator = %id,
+                src,
+                "Voluntary exit"
             );
 
             validator.with_epoch_summary(epoch, |summary| summary.register_exit());
@@ -1463,7 +1783,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     fn register_proposer_slashing(&self, src: &str, slashing: &ProposerSlashing) {
         let proposer = slashing.signed_header_1.message.proposer_index;
         let slot = slashing.signed_header_1.message.slot;
-        let epoch = slot.epoch(T::slots_per_epoch());
+        let epoch = slot.epoch(E::slots_per_epoch());
         let root_1 = slashing.signed_header_1.message.canonical_root();
         let root_2 = slashing.signed_header_2.message.canonical_root();
 
@@ -1480,13 +1800,12 @@ impl<T: EthSpec> ValidatorMonitor<T> {
             // Not gated behind `self.individual_tracking()` since it's an
             // infrequent and interesting message.
             crit!(
-                self.log,
-                "Proposer slashing";
-                "root_2" => %root_2,
-                "root_1" => %root_1,
-                "slot" => %slot,
-                "validator" => %id,
-                "src" => src,
+                %root_2,
+                %root_1,
+                %slot,
+                validator = %id,
+                src,
+                "Proposer slashing"
             );
 
             validator.with_epoch_summary(epoch, |summary| summary.register_proposer_slashing());
@@ -1494,38 +1813,36 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     }
 
     /// Register an attester slashing from the gossip network.
-    pub fn register_gossip_attester_slashing(&self, slashing: &AttesterSlashing<T>) {
+    pub fn register_gossip_attester_slashing(&self, slashing: AttesterSlashingRef<'_, E>) {
         self.register_attester_slashing("gossip", slashing)
     }
 
     /// Register an attester slashing from the HTTP API.
-    pub fn register_api_attester_slashing(&self, slashing: &AttesterSlashing<T>) {
+    pub fn register_api_attester_slashing(&self, slashing: AttesterSlashingRef<'_, E>) {
         self.register_attester_slashing("api", slashing)
     }
 
     /// Register an attester slashing included in a *valid* `BeaconBlock`.
-    pub fn register_block_attester_slashing(&self, slashing: &AttesterSlashing<T>) {
+    pub fn register_block_attester_slashing(&self, slashing: AttesterSlashingRef<'_, E>) {
         self.register_attester_slashing("block", slashing)
     }
 
-    fn register_attester_slashing(&self, src: &str, slashing: &AttesterSlashing<T>) {
-        let data = &slashing.attestation_1.data;
+    fn register_attester_slashing(&self, src: &str, slashing: AttesterSlashingRef<'_, E>) {
+        let data = slashing.attestation_1().data();
         let attestation_1_indices: HashSet<u64> = slashing
-            .attestation_1
-            .attesting_indices
-            .iter()
+            .attestation_1()
+            .attesting_indices_iter()
             .copied()
             .collect();
 
         slashing
-            .attestation_2
-            .attesting_indices
-            .iter()
+            .attestation_2()
+            .attesting_indices_iter()
             .filter(|index| attestation_1_indices.contains(index))
             .filter_map(|index| self.get_validator(*index))
             .for_each(|validator| {
                 let id = &validator.id;
-                let epoch = data.slot.epoch(T::slots_per_epoch());
+                let epoch = data.slot.epoch(E::slots_per_epoch());
 
                 self.aggregatable_metric(id, |label| {
                     metrics::inc_counter_vec(
@@ -1537,12 +1854,11 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                 // Not gated behind `self.individual_tracking()` since it's an
                 // infrequent and interesting message.
                 crit!(
-                    self.log,
-                    "Attester slashing";
-                    "epoch" => %epoch,
-                    "slot" => %data.slot,
-                    "validator" => %id,
-                    "src" => src,
+                    %epoch,
+                    slot = %data.slot,
+                    validator = %id,
+                    src,
+                    "Attester slashing"
                 );
 
                 validator.with_epoch_summary(epoch, |summary| summary.register_attester_slashing());
@@ -1559,8 +1875,8 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         );
 
         if let Some(slot) = slot_clock.now() {
-            let epoch = slot.epoch(T::slots_per_epoch());
-            let slot_in_epoch = slot % T::slots_per_epoch();
+            let epoch = slot.epoch(E::slots_per_epoch());
+            let slot_in_epoch = slot % E::slots_per_epoch();
 
             // Only start to report on the current epoch once we've progressed past the point where
             // all attestation should be included in a block.
@@ -1577,7 +1893,7 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                 epoch - 2
             };
 
-            for (_, validator) in self.validators.iter() {
+            for validator in self.validators.values() {
                 let id = &validator.id;
                 let summaries = validator.summaries.read();
 
@@ -1731,21 +2047,52 @@ impl<T: EthSpec> ValidatorMonitor<T> {
     }
 }
 
-/// Returns the duration since the unix epoch.
-pub fn timestamp_now() -> Duration {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
+fn register_simulated_attestation(
+    data: &AttestationData,
+    head_hit: bool,
+    target_hit: bool,
+    source_hit: bool,
+) {
+    if head_hit {
+        metrics::inc_counter(&metrics::VALIDATOR_MONITOR_ATTESTATION_SIMULATOR_HEAD_ATTESTER_HIT);
+    } else {
+        metrics::inc_counter(&metrics::VALIDATOR_MONITOR_ATTESTATION_SIMULATOR_HEAD_ATTESTER_MISS);
+    }
+    if target_hit {
+        metrics::inc_counter(&metrics::VALIDATOR_MONITOR_ATTESTATION_SIMULATOR_TARGET_ATTESTER_HIT);
+    } else {
+        metrics::inc_counter(
+            &metrics::VALIDATOR_MONITOR_ATTESTATION_SIMULATOR_TARGET_ATTESTER_MISS,
+        );
+    }
+    if source_hit {
+        metrics::inc_counter(&metrics::VALIDATOR_MONITOR_ATTESTATION_SIMULATOR_SOURCE_ATTESTER_HIT);
+    } else {
+        metrics::inc_counter(
+            &metrics::VALIDATOR_MONITOR_ATTESTATION_SIMULATOR_SOURCE_ATTESTER_MISS,
+        );
+    }
+
+    debug!(
+        attestation_source = ?data.source.root,
+        attestation_target = ?data.target.root,
+        attestation_head = ?data.beacon_block_root,
+        attestation_slot = ?data.slot,
+        source_hit,
+        target_hit,
+        head_hit,
+        "Simulated attestation evaluated"
+    );
 }
 
 fn u64_to_i64(n: impl Into<u64>) -> i64 {
-    i64::try_from(n.into()).unwrap_or(i64::max_value())
+    i64::try_from(n.into()).unwrap_or(i64::MAX)
 }
 
 /// Returns the delay between the start of `block.slot` and `seen_timestamp`.
-pub fn get_block_delay_ms<T: EthSpec, S: SlotClock, P: AbstractExecPayload<T>>(
+pub fn get_block_delay_ms<E: EthSpec, S: SlotClock, P: AbstractExecPayload<E>>(
     seen_timestamp: Duration,
-    block: BeaconBlockRef<'_, T, P>,
+    block: BeaconBlockRef<'_, E, P>,
     slot_clock: &S,
 ) -> Duration {
     get_slot_delay_ms::<S>(seen_timestamp, block.slot(), slot_clock)

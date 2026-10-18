@@ -4,16 +4,17 @@ version = "0.2.0"
 authors = ["Paul Hauner <paul@paulhauner.com>"]
 edition = { workspace = true }
 
-[[bench]]
-name = "benches"
-harness = false
+[features]
+arbitrary = ["alloy-primitives/arbitrary"]
+
+[dependencies]
+alloy-primitives = { workspace = true }
+ethereum_hashing = { workspace = true }
+fixed_bytes = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 
-[dependencies]
-ethereum_hashing = { workspace = true }
-ethereum-types = { workspace = true }
-
-[features]
-arbitrary = ["ethereum-types/arbitrary"]
+[[bench]]
+name = "benches"
+harness = false

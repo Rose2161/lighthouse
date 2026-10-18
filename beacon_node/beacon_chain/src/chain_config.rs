@@ -1,12 +1,9 @@
-pub use proto_array::{DisallowedReOrgOffsets, ReOrgThreshold};
+use crate::custody_context::NodeCustodyType;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use types::{Checkpoint, Epoch, ProgressiveBalancesMode};
+use std::str::FromStr;
+use std::{collections::HashSet, sync::LazyLock, time::Duration};
+use types::{Checkpoint, Hash256};
 
-pub const DEFAULT_RE_ORG_THRESHOLD: ReOrgThreshold = ReOrgThreshold(20);
-pub const DEFAULT_RE_ORG_MAX_EPOCHS_SINCE_FINALIZATION: Epoch = Epoch::new(2);
-/// Default to 1/12th of the slot, which is 1 second on mainnet.
-pub const DEFAULT_RE_ORG_CUTOFF_DENOMINATOR: u32 = 12;
 pub const DEFAULT_FORK_CHOICE_BEFORE_PROPOSAL_TIMEOUT: u64 = 250;
 
 /// Default fraction of a slot lookahead for payload preparation (12/3 = 4 seconds on mainnet).
@@ -14,6 +11,15 @@ pub const DEFAULT_PREPARE_PAYLOAD_LOOKAHEAD_FACTOR: u32 = 3;
 
 /// Fraction of a slot lookahead for fork choice in the state advance timer (500ms on mainnet).
 pub const FORK_CHOICE_LOOKAHEAD_FACTOR: u32 = 24;
+
+/// Default sync tolerance epochs.
+pub const DEFAULT_SYNC_TOLERANCE_EPOCHS: u64 = 2;
+
+/// Invalid block root to be banned from processing and importing on Holesky network by default.
+pub static INVALID_HOLESKY_BLOCK_ROOT: LazyLock<Hash256> = LazyLock::new(|| {
+    Hash256::from_str("2db899881ed8546476d0b92c6aa9110bea9a4cd0dbeb5519eb0ea69575f1f359")
+        .expect("valid block root")
+});
 
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 pub struct ChainConfig {
@@ -26,22 +32,9 @@ pub struct ChainConfig {
     /// If `None`, there is no weak subjectivity verification.
     pub weak_subjectivity_checkpoint: Option<Checkpoint>,
     /// Determine whether to reconstruct historic states, usually after a checkpoint sync.
-    pub reconstruct_historic_states: bool,
-    /// Whether timeouts on `TimeoutRwLock`s are enabled or not.
-    pub enable_lock_timeouts: bool,
+    pub archive: bool,
     /// The max size of a message that can be sent over the network.
     pub max_network_size: usize,
-    /// Maximum percentage of committee weight at which to attempt re-orging the canonical head.
-    pub re_org_threshold: Option<ReOrgThreshold>,
-    /// Maximum number of epochs since finalization for attempting a proposer re-org.
-    pub re_org_max_epochs_since_finalization: Epoch,
-    /// Maximum delay after the start of the slot at which to propose a reorging block.
-    pub re_org_cutoff_millis: Option<u64>,
-    /// Additional epoch offsets at which re-orging block proposals are not permitted.
-    ///
-    /// By default this list is empty, but it can be useful for reacting to network conditions, e.g.
-    /// slow gossip of re-org blocks at slot 1 in the epoch.
-    pub re_org_disallowed_offsets: DisallowedReOrgOffsets,
     /// Number of milliseconds to wait for fork choice before proposing a block.
     ///
     /// If set to 0 then block proposal will not wait for fork choice at all.
@@ -75,14 +68,46 @@ pub struct ChainConfig {
     /// If using a weak-subjectivity sync, whether we should download blocks all the way back to
     /// genesis.
     pub genesis_backfill: bool,
+    /// EXPERIMENTAL: backfill blobs and data columns beyond the data availability window.
+    pub complete_blob_backfill: bool,
     /// Whether to send payload attributes every slot, regardless of connected proposers.
     ///
     /// This is useful for block builders and testing.
     pub always_prepare_payload: bool,
-    /// Whether to use `ProgressiveBalancesCache` in unrealized FFG progression calculation.
-    pub progressive_balances_mode: ProgressiveBalancesMode,
     /// Number of epochs between each migration of data from the hot database to the freezer.
     pub epochs_per_migration: u64,
+    /// When set to true Light client server computes and caches state proofs for serving updates
+    pub enable_light_client_server: bool,
+    /// The number of data columns to withhold / exclude from publishing when proposing a block.
+    pub malicious_withhold_count: usize,
+    /// Number of batches that the node splits blobs or data columns into during publication.
+    /// This doesn't apply if the node is the block proposer. For PeerDAS only.
+    pub blob_publication_batches: usize,
+    /// The delay in milliseconds applied by the node between sending each blob or data column batch.
+    /// This doesn't apply if the node is the block proposer.
+    pub blob_publication_batch_interval: Duration,
+    /// The max distance between the head block and the current slot at which Lighthouse will
+    /// consider itself synced and still serve validator-related requests.
+    pub sync_tolerance_epochs: u64,
+    /// Artificial delay for block publishing. For PeerDAS testing only.
+    pub block_publishing_delay: Option<Duration>,
+    /// Artificial delay for data column publishing. For PeerDAS testing only.
+    pub data_column_publishing_delay: Option<Duration>,
+    /// Block roots of "banned" blocks which Lighthouse will refuse to import.
+    ///
+    /// On Holesky there is a block which is added to this set by default but which can be removed
+    /// by using `--invalid-block-roots ""`.
+    pub invalid_block_roots: HashSet<Hash256>,
+    /// When set to true, the beacon node can be started even if the head state is outside the weak subjectivity period.
+    pub ignore_ws_check: bool,
+    /// Disable the getBlobs optimisation to fetch blobs from the EL mempool.
+    pub disable_get_blobs: bool,
+    /// Whether to enable partial data column support.
+    pub enable_partial_columns: bool,
+    /// The node's custody type, determining how many data columns to custody and sample.
+    pub node_custody_type: NodeCustodyType,
+    /// Disable proposer re-org
+    pub disable_proposer_reorg: bool,
 }
 
 impl Default for ChainConfig {
@@ -90,13 +115,8 @@ impl Default for ChainConfig {
         Self {
             import_max_skip_slots: None,
             weak_subjectivity_checkpoint: None,
-            reconstruct_historic_states: false,
-            enable_lock_timeouts: true,
+            archive: false,
             max_network_size: 10 * 1_048_576, // 10M
-            re_org_threshold: Some(DEFAULT_RE_ORG_THRESHOLD),
-            re_org_max_epochs_since_finalization: DEFAULT_RE_ORG_MAX_EPOCHS_SINCE_FINALIZATION,
-            re_org_cutoff_millis: None,
-            re_org_disallowed_offsets: DisallowedReOrgOffsets::default(),
             fork_choice_before_proposal_timeout_ms: DEFAULT_FORK_CHOICE_BEFORE_PROPOSAL_TIMEOUT,
             // Builder fallback configs that are set in `clap` will override these.
             builder_fallback_skips: 3,
@@ -111,20 +131,22 @@ impl Default for ChainConfig {
             optimistic_finalized_sync: true,
             shuffling_cache_size: crate::shuffling_cache::DEFAULT_CACHE_SIZE,
             genesis_backfill: false,
+            complete_blob_backfill: false,
             always_prepare_payload: false,
-            progressive_balances_mode: ProgressiveBalancesMode::Checked,
             epochs_per_migration: crate::migrate::DEFAULT_EPOCHS_PER_MIGRATION,
+            enable_light_client_server: true,
+            malicious_withhold_count: 0,
+            blob_publication_batches: 4,
+            blob_publication_batch_interval: Duration::from_millis(300),
+            sync_tolerance_epochs: DEFAULT_SYNC_TOLERANCE_EPOCHS,
+            block_publishing_delay: None,
+            data_column_publishing_delay: None,
+            invalid_block_roots: HashSet::new(),
+            ignore_ws_check: false,
+            disable_get_blobs: false,
+            enable_partial_columns: false,
+            node_custody_type: NodeCustodyType::Fullnode,
+            disable_proposer_reorg: false,
         }
-    }
-}
-
-impl ChainConfig {
-    /// The latest delay from the start of the slot at which to attempt a 1-slot re-org.
-    pub fn re_org_cutoff(&self, seconds_per_slot: u64) -> Duration {
-        self.re_org_cutoff_millis
-            .map(Duration::from_millis)
-            .unwrap_or_else(|| {
-                Duration::from_secs(seconds_per_slot) / DEFAULT_RE_ORG_CUTOFF_DENOMINATOR
-            })
     }
 }

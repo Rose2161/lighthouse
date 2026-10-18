@@ -1,6 +1,9 @@
 use crate::{DBColumn, Error, StoreItem};
 use ssz::{Decode, Encode};
-use types::{EthSpec, ExecutionPayload, ExecutionPayloadCapella, ExecutionPayloadMerge};
+use types::{
+    EthSpec, ExecutionPayload, ExecutionPayloadBellatrix, ExecutionPayloadCapella,
+    ExecutionPayloadDeneb, ExecutionPayloadElectra, ExecutionPayloadFulu, ExecutionPayloadGloas,
+};
 
 macro_rules! impl_store_item {
     ($ty_name:ident) => {
@@ -19,8 +22,12 @@ macro_rules! impl_store_item {
         }
     };
 }
-impl_store_item!(ExecutionPayloadMerge);
+impl_store_item!(ExecutionPayloadBellatrix);
 impl_store_item!(ExecutionPayloadCapella);
+impl_store_item!(ExecutionPayloadDeneb);
+impl_store_item!(ExecutionPayloadElectra);
+impl_store_item!(ExecutionPayloadFulu);
+impl_store_item!(ExecutionPayloadGloas);
 
 /// This fork-agnostic implementation should be only used for writing.
 ///
@@ -36,9 +43,28 @@ impl<E: EthSpec> StoreItem for ExecutionPayload<E> {
     }
 
     fn from_store_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        ExecutionPayloadCapella::from_ssz_bytes(bytes)
-            .map(Self::Capella)
-            .or_else(|_| ExecutionPayloadMerge::from_ssz_bytes(bytes).map(Self::Merge))
+        if let Ok(payload) = ExecutionPayloadGloas::from_ssz_bytes(bytes) {
+            return Ok(Self::Gloas(payload));
+        }
+
+        if let Ok(payload) = ExecutionPayloadFulu::from_ssz_bytes(bytes) {
+            return Ok(Self::Fulu(payload));
+        }
+
+        if let Ok(payload) = ExecutionPayloadElectra::from_ssz_bytes(bytes) {
+            return Ok(Self::Electra(payload));
+        }
+
+        if let Ok(payload) = ExecutionPayloadDeneb::from_ssz_bytes(bytes) {
+            return Ok(Self::Deneb(payload));
+        }
+
+        if let Ok(payload) = ExecutionPayloadCapella::from_ssz_bytes(bytes) {
+            return Ok(Self::Capella(payload));
+        }
+
+        ExecutionPayloadBellatrix::from_ssz_bytes(bytes)
+            .map(Self::Bellatrix)
             .map_err(Into::into)
     }
 }

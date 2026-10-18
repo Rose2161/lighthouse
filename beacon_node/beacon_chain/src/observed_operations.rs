@@ -1,7 +1,6 @@
-use derivative::Derivative;
-use smallvec::{smallvec, SmallVec};
-use ssz::{Decode, Encode};
-use state_processing::{SigVerifiedOp, VerifyOperation, VerifyOperationAt};
+use educe::Educe;
+use smallvec::{SmallVec, smallvec};
+use state_processing::{SigVerifiedOp, TransformPersist, VerifyOperation, VerifyOperationAt};
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use types::{
@@ -15,8 +14,8 @@ pub const SMALL_VEC_SIZE: usize = 8;
 /// Stateful tracker for exit/slashing operations seen on the network.
 ///
 /// Implements the conditions for gossip verification of exits and slashings from the P2P spec.
-#[derive(Debug, Derivative)]
-#[derivative(Default(bound = "T: ObservableOperation<E>, E: EthSpec"))]
+#[derive(Debug, Educe)]
+#[educe(Default(bound(T: ObservableOperation<E>, E: EthSpec)))]
 pub struct ObservedOperations<T: ObservableOperation<E>, E: EthSpec> {
     /// Indices of validators for whom we have already seen an instance of an operation `T`.
     ///
@@ -27,14 +26,14 @@ pub struct ObservedOperations<T: ObservableOperation<E>, E: EthSpec> {
     /// `attestation_1.attester_indices` and `attestation_2.attester_indices`.
     observed_validator_indices: HashSet<u64>,
     /// The name of the current fork. The default will be overwritten on first use.
-    #[derivative(Default(value = "ForkName::Base"))]
+    #[educe(Default(expression = ForkName::Base))]
     current_fork: ForkName,
     _phantom: PhantomData<(T, E)>,
 }
 
 /// Was the observed operation new and valid for further processing, or a useless duplicate?
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub enum ObservationOutcome<T: Encode + Decode, E: EthSpec> {
+pub enum ObservationOutcome<T: TransformPersist, E: EthSpec> {
     New(SigVerifiedOp<T, E>),
     AlreadyKnown,
 }
@@ -62,15 +61,13 @@ impl<E: EthSpec> ObservableOperation<E> for ProposerSlashing {
 impl<E: EthSpec> ObservableOperation<E> for AttesterSlashing<E> {
     fn observed_validators(&self) -> SmallVec<[u64; SMALL_VEC_SIZE]> {
         let attestation_1_indices = self
-            .attestation_1
-            .attesting_indices
-            .iter()
+            .attestation_1()
+            .attesting_indices_iter()
             .copied()
             .collect::<HashSet<u64>>();
         let attestation_2_indices = self
-            .attestation_2
-            .attesting_indices
-            .iter()
+            .attestation_2()
+            .attesting_indices_iter()
             .copied()
             .collect::<HashSet<u64>>();
         attestation_1_indices
@@ -152,6 +149,11 @@ impl<T: ObservableOperation<E>, E: EthSpec> ObservedOperations<T, E> {
             self.observed_validator_indices.clear();
             self.current_fork = head_fork;
         }
+    }
+
+    /// Reset the cache. MUST ONLY BE USED IN TESTS.
+    pub fn __reset_for_testing_only(&mut self) {
+        self.observed_validator_indices.clear();
     }
 }
 

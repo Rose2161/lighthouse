@@ -1,8 +1,8 @@
 use super::*;
 use crate::case_result::compare_result;
 use crate::impl_bls_load_case;
-use bls::{verify_signature_sets, BlsWrappedSignature, PublicKeyBytes, Signature, SignatureSet};
-use serde_derive::Deserialize;
+use bls::{BlsWrappedSignature, PublicKeyBytes, Signature, SignatureSet, verify_signature_sets};
+use serde::Deserialize;
 use std::borrow::Cow;
 use std::str::FromStr;
 use types::Hash256;

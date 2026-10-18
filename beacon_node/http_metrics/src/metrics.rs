@@ -1,10 +1,8 @@
 use crate::Context;
 use beacon_chain::BeaconChainTypes;
-use lighthouse_metrics::TextEncoder;
 use lighthouse_network::prometheus_client::encoding::text::encode;
 use malloc_utils::scrape_allocator_metrics;
-
-pub use lighthouse_metrics::*;
+use metrics::TextEncoder;
 
 pub fn gather_prometheus_metrics<T: BeaconChainTypes>(
     ctx: &Context<T>,
@@ -19,13 +17,13 @@ pub fn gather_prometheus_metrics<T: BeaconChainTypes>(
     // - Statically updated: things which are only updated at the time of the scrape (used where we
     // can avoid cluttering up code with metrics calls).
     //
-    // The `lighthouse_metrics` crate has a `DEFAULT_REGISTRY` global singleton (via `lazy_static`)
+    // The `metrics` crate has a `DEFAULT_REGISTRY` global singleton
     // which keeps the state of all the metrics. Dynamically updated things will already be
     // up-to-date in the registry (because they update themselves) however statically updated
     // things need to be "scraped".
     //
     // We proceed by, first updating all the static metrics using `scrape_for_metrics(..)`. Then,
-    // using `lighthouse_metrics::gather(..)` to collect the global `DEFAULT_REGISTRY` metrics into
+    // using `metrics::gather(..)` to collect the global `DEFAULT_REGISTRY` metrics into
     // a string that can be returned via HTTP.
 
     if let Some(beacon_chain) = ctx.chain.as_ref() {
@@ -39,9 +37,9 @@ pub fn gather_prometheus_metrics<T: BeaconChainTypes>(
         store::scrape_for_metrics(db_path, freezer_db_path);
     }
 
-    lighthouse_network::scrape_discovery_metrics();
+    network_utils::discovery_metrics::scrape_discovery_metrics();
 
-    warp_utils::metrics::scrape_health_metrics();
+    health_metrics::metrics::scrape_health_metrics();
 
     // It's important to ensure these metrics are explicitly enabled in the case that users aren't
     // using glibc and this function causes panics.
@@ -50,13 +48,13 @@ pub fn gather_prometheus_metrics<T: BeaconChainTypes>(
     }
 
     encoder
-        .encode_utf8(&lighthouse_metrics::gather(), &mut buffer)
+        .encode_utf8(&metrics::gather(), &mut buffer)
         .unwrap();
     // encode gossipsub metrics also if they exist
-    if let Some(registry) = ctx.gossipsub_registry.as_ref() {
-        if let Ok(registry_locked) = registry.lock() {
-            let _ = encode(&mut buffer, &registry_locked);
-        }
+    if let Some(registry) = ctx.gossipsub_registry.as_ref()
+        && let Ok(registry_locked) = registry.lock()
+    {
+        let _ = encode(&mut buffer, &registry_locked);
     }
 
     Ok(buffer)

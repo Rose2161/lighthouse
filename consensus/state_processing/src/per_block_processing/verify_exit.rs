@@ -1,7 +1,7 @@
 use super::errors::{BlockOperationError, ExitInvalid};
 use crate::per_block_processing::{
-    signature_sets::{exit_signature_set, get_pubkey_from_state},
     VerifySignatures,
+    signature_sets::{exit_signature_set, get_pubkey_from_state},
 };
 use safe_arith::SafeArith;
 use types::*;
@@ -18,8 +18,8 @@ fn error(reason: ExitInvalid) -> BlockOperationError<ExitInvalid> {
 /// Returns `Ok(())` if the `Exit` is valid, otherwise indicates the reason for invalidity.
 ///
 /// Spec v0.12.1
-pub fn verify_exit<T: EthSpec>(
-    state: &BeaconState<T>,
+pub fn verify_exit<E: EthSpec>(
+    state: &BeaconState<E>,
     current_epoch: Option<Epoch>,
     signed_exit: &SignedVoluntaryExit,
     verify_signatures: VerifySignatures,
@@ -76,6 +76,17 @@ pub fn verify_exit<T: EthSpec>(
             )?
             .verify(),
             ExitInvalid::BadSignature
+        );
+    }
+
+    // [New in Electra:EIP7251]
+    // Only exit validator if it has no pending withdrawals in the queue
+    if let Ok(pending_balance_to_withdraw) =
+        state.get_pending_balance_to_withdraw(exit.validator_index as usize)
+    {
+        verify!(
+            pending_balance_to_withdraw == 0,
+            ExitInvalid::PendingWithdrawalInQueue(exit.validator_index)
         );
     }
 
