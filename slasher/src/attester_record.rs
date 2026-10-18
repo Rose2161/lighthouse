@@ -1,13 +1,15 @@
-use crate::{database::IndexedAttestationId, Error};
+use crate::{Error, database::IndexedAttestationId};
+use bls::AggregateSignature;
 use ssz_derive::{Decode, Encode};
+use ssz_types::VariableList;
 use std::borrow::Cow;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use tree_hash::TreeHash as _;
 use tree_hash_derive::TreeHash;
-use types::{AggregateSignature, EthSpec, Hash256, IndexedAttestation, VariableList};
+use types::{EthSpec, Hash256, IndexedAttestation};
 
 #[derive(Debug, Clone, Copy)]
 pub struct AttesterRecord {
@@ -79,19 +81,21 @@ impl<E: EthSpec> IndexedAttesterRecord<E> {
 }
 
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]
-struct IndexedAttestationHeader<T: EthSpec> {
-    pub attesting_indices: VariableList<u64, T::MaxValidatorsPerCommittee>,
+struct IndexedAttestationHeader<E: EthSpec> {
+    pub attesting_indices: VariableList<u64, E::MaxValidatorsPerSlot>,
     pub data_root: Hash256,
     pub signature: AggregateSignature,
 }
 
-impl<T: EthSpec> From<IndexedAttestation<T>> for AttesterRecord {
-    fn from(indexed_attestation: IndexedAttestation<T>) -> AttesterRecord {
-        let attestation_data_hash = indexed_attestation.data.tree_hash_root();
-        let header = IndexedAttestationHeader::<T> {
-            attesting_indices: indexed_attestation.attesting_indices,
+impl<E: EthSpec> From<IndexedAttestation<E>> for AttesterRecord {
+    fn from(indexed_attestation: IndexedAttestation<E>) -> AttesterRecord {
+        let attestation_data_hash = indexed_attestation.data().tree_hash_root();
+        let attesting_indices =
+            VariableList::new(indexed_attestation.attesting_indices_to_vec()).unwrap_or_default();
+        let header = IndexedAttestationHeader::<E> {
+            attesting_indices,
             data_root: attestation_data_hash,
-            signature: indexed_attestation.signature,
+            signature: indexed_attestation.signature().clone(),
         };
         let indexed_attestation_hash = header.tree_hash_root();
         AttesterRecord {
@@ -104,15 +108,15 @@ impl<T: EthSpec> From<IndexedAttestation<T>> for AttesterRecord {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::test_utils::indexed_att;
+    use crate::test_utils::indexed_att_electra;
 
     // Check correctness of fast hashing
     #[test]
     fn fast_hash() {
         let data = vec![
-            indexed_att(vec![], 0, 0, 0),
-            indexed_att(vec![1, 2, 3], 12, 14, 1),
-            indexed_att(vec![4], 0, 5, u64::MAX),
+            indexed_att_electra(vec![], 0, 0, 0),
+            indexed_att_electra(vec![1, 2, 3], 12, 14, 1),
+            indexed_att_electra(vec![4], 0, 5, u64::MAX),
         ];
         for att in data {
             assert_eq!(

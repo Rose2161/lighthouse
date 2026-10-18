@@ -3,18 +3,19 @@
 //! Serves as the source-of-truth of which validators this validator client should attempt (or not
 //! attempt) to load into the `crate::intialized_validators::InitializedValidators` struct.
 
-use crate::{default_keystore_password_path, write_file_via_temporary, ZeroizeString};
-use directory::ensure_dir_exists;
+use crate::{default_keystore_password_path, read_password_string, write_file_via_temporary};
+use bls::PublicKey;
 use eth2_keystore::Keystore;
 use regex::Regex;
-use serde_derive::{Deserialize, Serialize};
-use slog::{error, Logger};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::{self, File, create_dir_all};
 use std::io;
 use std::path::{Path, PathBuf};
-use types::{graffiti::GraffitiString, Address, PublicKey};
+use tracing::{debug, error};
+use types::{Address, graffiti::GraffitiString};
 use validator_dir::VOTING_KEYSTORE_FILE;
+use zeroize::Zeroizing;
 
 /// The file name for the serialized `ValidatorDefinitions` struct.
 pub const CONFIG_FILENAME: &str = "validator_definitions.yml";
@@ -30,11 +31,11 @@ pub enum Error {
     /// The config file could not be opened.
     UnableToOpenFile(io::Error),
     /// The config file could not be parsed as YAML.
-    UnableToParseFile(serde_yaml::Error),
+    UnableToParseFile(yaml_serde::Error),
     /// There was an error whilst performing the recursive keystore search function.
     UnableToSearchForKeystores(io::Error),
     /// The config file could not be serialized as YAML.
-    UnableToEncodeFile(serde_yaml::Error),
+    UnableToEncodeFile(yaml_serde::Error),
     /// The config file or temp file could not be written to the filesystem.
     UnableToWriteFile(filesystem::Error),
     /// The public key from the keystore is invalid.
@@ -43,6 +44,18 @@ pub enum Error {
     UnableToOpenKeystore(eth2_keystore::Error),
     /// The validator directory could not be created.
     UnableToCreateValidatorDir(PathBuf),
+    UnableToReadKeystorePassword(String),
+    KeystoreWithoutPassword,
+}
+
+/// Defines how a password for a validator keystore will be persisted.
+pub enum PasswordStorage {
+    /// Store the password in the `validator_definitions.yml` file.
+    ValidatorDefinitions(Zeroizing<String>),
+    /// Store the password in a separate, dedicated file (likely in the "secrets" directory).
+    File(PathBuf),
+    /// Don't store the password at all.
+    None,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Hash, Eq)]
@@ -79,7 +92,7 @@ pub enum SigningDefinition {
         #[serde(skip_serializing_if = "Option::is_none")]
         voting_keystore_password_path: Option<PathBuf>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        voting_keystore_password: Option<ZeroizeString>,
+        voting_keystore_password: Option<Zeroizing<String>>,
     },
     /// A validator that defers to a Web3Signer HTTP server for signing.
     ///
@@ -91,6 +104,33 @@ pub enum SigningDefinition {
 impl SigningDefinition {
     pub fn is_local_keystore(&self) -> bool {
         matches!(self, SigningDefinition::LocalKeystore { .. })
+    }
+
+    pub fn voting_keystore_password(&self) -> Result<Option<Zeroizing<String>>, Error> {
+        match self {
+            SigningDefinition::LocalKeystore {
+                voting_keystore_password: Some(password),
+                ..
+            } => Ok(Some(password.clone())),
+            SigningDefinition::LocalKeystore {
+                voting_keystore_password_path: Some(path),
+                ..
+            } => read_password_string(path)
+                .map(Option::Some)
+                .map_err(Error::UnableToReadKeystorePassword),
+            SigningDefinition::LocalKeystore { .. } => Err(Error::KeystoreWithoutPassword),
+            SigningDefinition::Web3Signer(_) => Ok(None),
+        }
+    }
+
+    pub fn voting_keystore_password_path(&self) -> Option<&PathBuf> {
+        match self {
+            SigningDefinition::LocalKeystore {
+                voting_keystore_password_path: Some(path),
+                ..
+            } => Some(path),
+            _ => None,
+        }
     }
 }
 
@@ -115,6 +155,12 @@ pub struct ValidatorDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub builder_proposals: Option<bool>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builder_boost_factor: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefer_builder_proposals: Option<bool>,
+    #[serde(default)]
     pub description: String,
     #[serde(flatten)]
     pub signing_definition: SigningDefinition,
@@ -127,18 +173,27 @@ impl ValidatorDefinition {
     /// ## Notes
     ///
     /// This function does not check the password against the keystore.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_keystore_with_password<P: AsRef<Path>>(
         voting_keystore_path: P,
-        voting_keystore_password: Option<ZeroizeString>,
+        voting_keystore_password_storage: PasswordStorage,
         graffiti: Option<GraffitiString>,
         suggested_fee_recipient: Option<Address>,
         gas_limit: Option<u64>,
         builder_proposals: Option<bool>,
+        builder_boost_factor: Option<u64>,
+        prefer_builder_proposals: Option<bool>,
     ) -> Result<Self, Error> {
         let voting_keystore_path = voting_keystore_path.as_ref().into();
         let keystore =
             Keystore::from_json_file(&voting_keystore_path).map_err(Error::UnableToOpenKeystore)?;
         let voting_public_key = keystore.public_key().ok_or(Error::InvalidKeystorePubkey)?;
+        let (voting_keystore_password_path, voting_keystore_password) =
+            match voting_keystore_password_storage {
+                PasswordStorage::ValidatorDefinitions(password) => (None, Some(password)),
+                PasswordStorage::File(path) => (Some(path), None),
+                PasswordStorage::None => (None, None),
+            };
 
         Ok(ValidatorDefinition {
             enabled: true,
@@ -148,12 +203,24 @@ impl ValidatorDefinition {
             suggested_fee_recipient,
             gas_limit,
             builder_proposals,
+            builder_boost_factor,
+            prefer_builder_proposals,
             signing_definition: SigningDefinition::LocalKeystore {
                 voting_keystore_path,
-                voting_keystore_password_path: None,
+                voting_keystore_password_path,
                 voting_keystore_password,
             },
         })
+    }
+
+    pub fn check_fee_recipient(&self, global_fee_recipient: Option<Address>) -> Option<&PublicKey> {
+        // Skip disabled validators. Also skip if validator has its own fee set, or the global flag is set
+        if !self.enabled || self.suggested_fee_recipient.is_some() || global_fee_recipient.is_some()
+        {
+            return None;
+        }
+
+        Some(&self.voting_public_key)
     }
 }
 
@@ -171,7 +238,7 @@ impl From<Vec<ValidatorDefinition>> for ValidatorDefinitions {
 impl ValidatorDefinitions {
     /// Open an existing file or create a new, empty one if it does not exist.
     pub fn open_or_create<P: AsRef<Path>>(validators_dir: P) -> Result<Self, Error> {
-        ensure_dir_exists(validators_dir.as_ref()).map_err(|_| {
+        create_dir_all(validators_dir.as_ref()).map_err(|_| {
             Error::UnableToCreateValidatorDir(PathBuf::from(validators_dir.as_ref()))
         })?;
         let config_path = validators_dir.as_ref().join(CONFIG_FILENAME);
@@ -189,9 +256,9 @@ impl ValidatorDefinitions {
             .write(true)
             .read(true)
             .create_new(false)
-            .open(&config_path)
+            .open(config_path)
             .map_err(Error::UnableToOpenFile)?;
-        serde_yaml::from_reader(file).map_err(Error::UnableToParseFile)
+        yaml_serde::from_reader(file).map_err(Error::UnableToParseFile)
     }
 
     /// Perform a recursive, exhaustive search through `validators_dir` and add any keystores
@@ -210,7 +277,6 @@ impl ValidatorDefinitions {
         &mut self,
         validators_dir: P,
         secrets_dir: P,
-        log: &Logger,
     ) -> Result<usize, Error> {
         let mut keystore_paths = vec![];
         recursively_find_voting_keystores(validators_dir, &mut keystore_paths)
@@ -255,10 +321,9 @@ impl ValidatorDefinitions {
                     Ok(keystore) => keystore,
                     Err(e) => {
                         error!(
-                            log,
-                            "Unable to read validator keystore";
-                            "error" => e,
-                            "keystore" => format!("{:?}", voting_keystore_path)
+                            error = ?e,
+                            keystore = ?voting_keystore_path,
+                            "Unable to read validator keystore"
                         );
                         return None;
                     }
@@ -280,9 +345,8 @@ impl ValidatorDefinitions {
                     }
                     None => {
                         error!(
-                            log,
-                            "Invalid keystore public key";
-                            "keystore" => format!("{:?}", voting_keystore_path)
+                            keystore = ?voting_keystore_path,
+                            "Invalid keystore public key"
                         );
                         return None;
                     }
@@ -296,6 +360,8 @@ impl ValidatorDefinitions {
                     suggested_fee_recipient: None,
                     gas_limit: None,
                     builder_proposals: None,
+                    builder_boost_factor: None,
+                    prefer_builder_proposals: None,
                     signing_definition: SigningDefinition::LocalKeystore {
                         voting_keystore_path,
                         voting_keystore_password_path,
@@ -319,7 +385,8 @@ impl ValidatorDefinitions {
     pub fn save<P: AsRef<Path>>(&self, validators_dir: P) -> Result<(), Error> {
         let config_path = validators_dir.as_ref().join(CONFIG_FILENAME);
         let temp_path = validators_dir.as_ref().join(CONFIG_TEMP_FILENAME);
-        let bytes = serde_yaml::to_vec(self).map_err(Error::UnableToEncodeFile)?;
+        let mut bytes = vec![];
+        yaml_serde::to_writer(&mut bytes, self).map_err(Error::UnableToEncodeFile)?;
 
         write_file_via_temporary(&config_path, &temp_path, &bytes)
             .map_err(Error::UnableToWriteFile)?;
@@ -346,6 +413,59 @@ impl ValidatorDefinitions {
     pub fn as_mut_slice(&mut self) -> &mut [ValidatorDefinition] {
         self.0.as_mut_slice()
     }
+
+    // Returns an iterator over all the `voting_keystore_password_paths` in self.
+    pub fn iter_voting_keystore_password_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.0
+            .iter()
+            .filter_map(|def| def.signing_definition.voting_keystore_password_path())
+    }
+
+    /// Called after loading to run safety checks on all validators
+    pub fn check_all_fee_recipients(
+        &self,
+        global_fee_recipient: Option<Address>,
+    ) -> Result<(), String> {
+        let missing: Vec<&PublicKey> = self
+            .0
+            .iter()
+            .filter_map(|def| def.check_fee_recipient(global_fee_recipient))
+            .collect();
+
+        if !missing.is_empty() {
+            let pubkeys = missing
+                .iter()
+                .map(|pk| pk.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            return Err(format!(
+                "The following validators are missing a `suggested_fee_recipient`: {}. \
+                 Fix this by adding a `suggested_fee_recipient` in the \
+                 `validator_definitions.yml` or by supplying a fallback fee \
+                 recipient via the `--suggested-fee-recipient` flag.",
+                pubkeys
+            ));
+        }
+
+        // Friendly reminder for users using the fallback flag
+        if global_fee_recipient.is_some() {
+            let count = self
+                .0
+                .iter()
+                .filter(|d| d.enabled && d.suggested_fee_recipient.is_none())
+                .count();
+            if count > 0 {
+                debug!(
+                    "The fallback --suggested-fee-recipient is being used for {} validator(s). \
+                     You may alternatively set the fee recipient for each validator individually via `validator_definitions.yml`.",
+                    count
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Perform an exhaustive tree search of `dir`, adding any discovered voting keystore paths to
@@ -367,7 +487,7 @@ pub fn recursively_find_voting_keystores<P: AsRef<Path>>(
             && dir_entry
                 .file_name()
                 .to_str()
-                .map_or(false, is_voting_keystore)
+                .is_some_and(is_voting_keystore)
         {
             matches.push(dir_entry.path())
         }
@@ -387,11 +507,11 @@ pub fn is_voting_keystore(file_name: &str) -> bool {
         return true;
     }
 
-    // The format exported by the `eth2.0-deposit-cli` library.
+    // The format exported by the `ethstaker-deposit-cli` library.
     //
     // Reference to function that generates keystores:
     //
-    // https://github.com/ethereum/eth2.0-deposit-cli/blob/7cebff15eac299b3b1b090c896dd3410c8463450/eth2deposit/credentials.py#L58-L62
+    // https://github.com/eth-educators/ethstaker-deposit-cli/blob/80d536374de838ccae142974ed0e747b46beb030/ethstaker_deposit/credentials.py#L186-L190
     //
     // Since we include the key derivation path of `m/12381/3600/x/0/0` this should only ever match
     // with a voting keystore and never a withdrawal keystore.
@@ -421,6 +541,7 @@ pub fn is_voting_keystore(file_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bls::Keypair;
     use std::str::FromStr;
 
     #[test]
@@ -467,7 +588,7 @@ mod tests {
         voting_keystore_path: ""
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
-        let def: ValidatorDefinition = serde_yaml::from_str(no_graffiti).unwrap();
+        let def: ValidatorDefinition = yaml_serde::from_str(no_graffiti).unwrap();
         assert!(def.graffiti.is_none());
 
         let invalid_graffiti = r#"---
@@ -479,7 +600,7 @@ mod tests {
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
 
-        let def: Result<ValidatorDefinition, _> = serde_yaml::from_str(invalid_graffiti);
+        let def: Result<ValidatorDefinition, _> = yaml_serde::from_str(invalid_graffiti);
         assert!(def.is_err());
 
         let valid_graffiti = r#"---
@@ -491,7 +612,7 @@ mod tests {
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
 
-        let def: ValidatorDefinition = serde_yaml::from_str(valid_graffiti).unwrap();
+        let def: ValidatorDefinition = yaml_serde::from_str(valid_graffiti).unwrap();
         assert_eq!(
             def.graffiti,
             Some(GraffitiString::from_str("mrfwashere").unwrap())
@@ -507,7 +628,7 @@ mod tests {
         voting_keystore_path: ""
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
-        let def: ValidatorDefinition = serde_yaml::from_str(no_suggested_fee_recipient).unwrap();
+        let def: ValidatorDefinition = yaml_serde::from_str(no_suggested_fee_recipient).unwrap();
         assert!(def.suggested_fee_recipient.is_none());
 
         let invalid_suggested_fee_recipient = r#"---
@@ -520,7 +641,7 @@ mod tests {
         "#;
 
         let def: Result<ValidatorDefinition, _> =
-            serde_yaml::from_str(invalid_suggested_fee_recipient);
+            yaml_serde::from_str(invalid_suggested_fee_recipient);
         assert!(def.is_err());
 
         let valid_suggested_fee_recipient = r#"---
@@ -532,7 +653,7 @@ mod tests {
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
 
-        let def: ValidatorDefinition = serde_yaml::from_str(valid_suggested_fee_recipient).unwrap();
+        let def: ValidatorDefinition = yaml_serde::from_str(valid_suggested_fee_recipient).unwrap();
         assert_eq!(
             def.suggested_fee_recipient,
             Some(Address::from_str("0xa2e334e71511686bcfe38bb3ee1ad8f6babcc03d").unwrap())
@@ -549,7 +670,7 @@ mod tests {
         voting_keystore_path: ""
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
-        let def: ValidatorDefinition = serde_yaml::from_str(no_gas_limit).unwrap();
+        let def: ValidatorDefinition = yaml_serde::from_str(no_gas_limit).unwrap();
         assert!(def.gas_limit.is_none());
 
         let invalid_gas_limit = r#"---
@@ -562,7 +683,7 @@ mod tests {
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
 
-        let def: Result<ValidatorDefinition, _> = serde_yaml::from_str(invalid_gas_limit);
+        let def: Result<ValidatorDefinition, _> = yaml_serde::from_str(invalid_gas_limit);
         assert!(def.is_err());
 
         let valid_gas_limit = r#"---
@@ -575,7 +696,7 @@ mod tests {
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
 
-        let def: ValidatorDefinition = serde_yaml::from_str(valid_gas_limit).unwrap();
+        let def: ValidatorDefinition = yaml_serde::from_str(valid_gas_limit).unwrap();
         assert_eq!(def.gas_limit, Some(35000000));
     }
 
@@ -589,7 +710,7 @@ mod tests {
         voting_keystore_path: ""
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
-        let def: ValidatorDefinition = serde_yaml::from_str(no_builder_proposals).unwrap();
+        let def: ValidatorDefinition = yaml_serde::from_str(no_builder_proposals).unwrap();
         assert!(def.builder_proposals.is_none());
 
         let invalid_builder_proposals = r#"---
@@ -602,7 +723,7 @@ mod tests {
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
 
-        let def: Result<ValidatorDefinition, _> = serde_yaml::from_str(invalid_builder_proposals);
+        let def: Result<ValidatorDefinition, _> = yaml_serde::from_str(invalid_builder_proposals);
         assert!(def.is_err());
 
         let valid_builder_proposals = r#"---
@@ -615,7 +736,238 @@ mod tests {
         voting_public_key: "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
         "#;
 
-        let def: ValidatorDefinition = serde_yaml::from_str(valid_builder_proposals).unwrap();
+        let def: ValidatorDefinition = yaml_serde::from_str(valid_builder_proposals).unwrap();
         assert_eq!(def.builder_proposals, Some(true));
+    }
+
+    #[test]
+    fn fee_recipient_check_enabled_validator_cases() {
+        let def = ValidatorDefinition {
+            enabled: true,
+            voting_public_key: PublicKey::from_str(
+                "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
+            ).unwrap(),
+            description: String::new(),
+            graffiti: None,
+            suggested_fee_recipient: None,
+            gas_limit: None,
+            builder_proposals: None,
+            builder_boost_factor: None,
+            prefer_builder_proposals: None,
+            signing_definition: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::new(),
+                voting_keystore_password_path: None,
+                voting_keystore_password: None,
+            }
+        };
+
+        // Should return Some(pubkey) when no fee recipient is set
+        let check_result = def.check_fee_recipient(None);
+        assert!(check_result.is_some());
+
+        // Should return None since global fee recipient is set
+        let global_fee_recipient =
+            Some(Address::from_str("0xa2e334e71511686bcfe38bb3ee1ad8f6babcc03d").unwrap());
+        let check_result = def.check_fee_recipient(global_fee_recipient);
+        assert!(check_result.is_none());
+    }
+
+    #[test]
+    fn fee_recipient_check_passes_with_validator_specific() {
+        let def = ValidatorDefinition {
+            enabled: true,
+            voting_public_key: PublicKey::from_str(
+                "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
+            ).unwrap(),
+            description: String::new(),
+            graffiti: None,
+            suggested_fee_recipient: Some(Address::from_str("0xa2e334e71511686bcfe38bb3ee1ad8f6babcc03d").unwrap()),
+            gas_limit: None,
+            builder_proposals: None,
+            builder_boost_factor: None,
+            prefer_builder_proposals: None,
+            signing_definition: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::new(),
+                voting_keystore_password_path: None,
+                voting_keystore_password: None,
+            },
+        };
+
+        // Should return None because suggested_fee_recipient is set
+        let check_result = def.check_fee_recipient(None);
+        assert!(check_result.is_none());
+    }
+
+    #[test]
+    fn fee_recipient_check_skips_disabled_validators() {
+        let def = ValidatorDefinition {
+            enabled: false,
+            voting_public_key: PublicKey::from_str(
+                "0xaf3c7ddab7e293834710fca2d39d068f884455ede270e0d0293dc818e4f2f0f975355067e8437955cb29aec674e5c9e7"
+            ).unwrap(),
+            description: String::new(),
+            graffiti: None,
+            suggested_fee_recipient: None,
+            gas_limit: None,
+            builder_proposals: None,
+            builder_boost_factor: None,
+            prefer_builder_proposals: None,
+            signing_definition: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::new(),
+                voting_keystore_password_path: None,
+                voting_keystore_password: None,
+            },
+        };
+
+        // Should return None because validator is disabled
+        let check_result = def.check_fee_recipient(None);
+        assert!(check_result.is_none());
+    }
+
+    #[test]
+    fn check_all_fee_recipients_reports_all_missing() {
+        let keypair1 = Keypair::random();
+        let keypair2 = Keypair::random();
+
+        let def1 = ValidatorDefinition {
+            enabled: true,
+            voting_public_key: keypair1.pk.clone(),
+            description: String::new(),
+            graffiti: None,
+            suggested_fee_recipient: None,
+            gas_limit: None,
+            builder_proposals: None,
+            builder_boost_factor: None,
+            prefer_builder_proposals: None,
+            signing_definition: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::new(),
+                voting_keystore_password_path: None,
+                voting_keystore_password: None,
+            },
+        };
+
+        let def2 = ValidatorDefinition {
+            enabled: true,
+            voting_public_key: keypair2.pk.clone(),
+            description: String::new(),
+            graffiti: None,
+            suggested_fee_recipient: None, // Missing recipient
+            gas_limit: None,
+            builder_proposals: None,
+            builder_boost_factor: None,
+            prefer_builder_proposals: None,
+            signing_definition: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::new(),
+                voting_keystore_password_path: None,
+                voting_keystore_password: None,
+            },
+        };
+
+        let defs = ValidatorDefinitions::from(vec![def1, def2]);
+
+        // Should fail because both defs have no fee recipient and no global fee recipient is set
+        let result = defs.check_all_fee_recipients(None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+
+        // Check that both public keys are mentioned in the error message
+        let pk1_string = keypair1.pk.to_string();
+        let pk2_string = keypair2.pk.to_string();
+
+        assert!(err.contains(&pk1_string), "Error message missing pubkey 1");
+        assert!(err.contains(&pk2_string), "Error message missing pubkey 2");
+        assert!(err.contains("are missing a `suggested_fee_recipient`"));
+    }
+
+    #[test]
+    fn check_all_fee_recipients_passes_all_configured() {
+        let keypair = Keypair::random();
+        let def1 = ValidatorDefinition {
+            enabled: true,
+            voting_public_key: keypair.pk.clone(),
+            description: String::new(),
+            graffiti: None,
+            suggested_fee_recipient: Some(
+                Address::from_str("0xa2e334e71511686bcfe38bb3ee1ad8f6babcc03d").unwrap(),
+            ),
+            gas_limit: None,
+            builder_proposals: None,
+            builder_boost_factor: None,
+            prefer_builder_proposals: None,
+            signing_definition: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::new(),
+                voting_keystore_password_path: None,
+                voting_keystore_password: None,
+            },
+        };
+
+        let def2 = ValidatorDefinition {
+            enabled: true,
+            voting_public_key: keypair.pk.clone(),
+            description: String::new(),
+            graffiti: None,
+            suggested_fee_recipient: Some(
+                Address::from_str("0xb2e334e71511686bcfe38bb3ee1ad8f6babcc03d").unwrap(),
+            ),
+            gas_limit: None,
+            builder_proposals: None,
+            builder_boost_factor: None,
+            prefer_builder_proposals: None,
+            signing_definition: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::new(),
+                voting_keystore_password_path: None,
+                voting_keystore_password: None,
+            },
+        };
+
+        let defs = ValidatorDefinitions::from(vec![def1, def2]);
+
+        // Should pass - all validators have fee recipients
+        assert!(defs.check_all_fee_recipients(None).is_ok());
+    }
+
+    #[test]
+    fn check_all_fee_recipients_passes_with_global() {
+        let keypair = Keypair::random();
+        let def1 = ValidatorDefinition {
+            enabled: true,
+            voting_public_key: keypair.pk.clone(),
+            description: String::new(),
+            graffiti: None,
+            suggested_fee_recipient: None,
+            gas_limit: None,
+            builder_proposals: None,
+            builder_boost_factor: None,
+            prefer_builder_proposals: None,
+            signing_definition: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::new(),
+                voting_keystore_password_path: None,
+                voting_keystore_password: None,
+            },
+        };
+
+        let def2 = ValidatorDefinition {
+            enabled: true,
+            voting_public_key: keypair.pk.clone(),
+            description: String::new(),
+            graffiti: None,
+            suggested_fee_recipient: None,
+            gas_limit: None,
+            builder_proposals: None,
+            builder_boost_factor: None,
+            prefer_builder_proposals: None,
+            signing_definition: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::new(),
+                voting_keystore_password_path: None,
+                voting_keystore_password: None,
+            },
+        };
+
+        let defs = ValidatorDefinitions::from(vec![def1, def2]);
+
+        // Should pass - global fee recipient is set
+        let global_fee_recipient =
+            Some(Address::from_str("0xa2e334e71511686bcfe38bb3ee1ad8f6babcc03d").unwrap());
+        assert!(defs.check_all_fee_recipients(global_fee_recipient).is_ok());
     }
 }

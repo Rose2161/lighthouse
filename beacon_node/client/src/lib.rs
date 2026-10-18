@@ -1,18 +1,16 @@
-extern crate slog;
-
+mod compute_light_client_updates;
 pub mod config;
 mod metrics;
 mod notifier;
 
 pub mod builder;
-pub mod error;
 
 use beacon_chain::BeaconChain;
 use lighthouse_network::{Enr, Multiaddr, NetworkGlobals};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-pub use beacon_chain::{BeaconChainTypes, Eth1ChainBackend};
+pub use beacon_chain::BeaconChainTypes;
 pub use builder::ClientBuilder;
 pub use config::{ClientGenesis, Config as ClientConfig};
 pub use eth2_config::Eth2Config;
@@ -43,11 +41,6 @@ impl<T: BeaconChainTypes> Client<T> {
     /// Returns the address of the client's HTTP Prometheus metrics server, if it was started.
     pub fn http_metrics_listen_addr(&self) -> Option<SocketAddr> {
         self.http_metrics_listen_addr
-    }
-
-    /// Returns the port of the client's libp2p stack, if it was started.
-    pub fn libp2p_listen_port(&self) -> Option<u16> {
-        self.network_globals.as_ref().map(|n| n.listen_port_tcp())
     }
 
     /// Returns the list of libp2p addresses the client is listening to.

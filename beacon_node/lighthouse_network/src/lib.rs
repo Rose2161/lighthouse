@@ -2,22 +2,18 @@
 /// all required libp2p functionality.
 ///
 /// This crate builds and manages the libp2p services required by the beacon node.
-#[macro_use]
-extern crate lazy_static;
-
 mod config;
 pub mod service;
 
-#[allow(clippy::mutable_key_type)] // PeerId in hashmaps are no longer permitted by clippy
 pub mod discovery;
 pub mod metrics;
 pub mod peer_manager;
 pub mod rpc;
 pub mod types;
 
-pub use config::gossip_max_size;
+use libp2p::swarm::DialError;
 
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::str::FromStr;
 
 /// Wrapper over a libp2p `PeerId` which implements `Serialize` and `Deserialize`
@@ -61,29 +57,67 @@ impl<'de> Deserialize<'de> for PeerIdSerialized {
     }
 }
 
+// A wrapper struct that prints a dial error nicely.
+struct ClearDialError<'a>(&'a DialError);
+
+impl ClearDialError<'_> {
+    fn most_inner_error(err: &dyn std::error::Error) -> &dyn std::error::Error {
+        let mut current = err;
+        while let Some(source) = current.source() {
+            current = source;
+        }
+        current
+    }
+}
+
+impl std::fmt::Display for ClearDialError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        match &self.0 {
+            DialError::Transport(errors) => {
+                for (_, transport_error) in errors {
+                    match transport_error {
+                        libp2p::TransportError::MultiaddrNotSupported(multiaddr_error) => {
+                            write!(f, "Multiaddr not supported: {multiaddr_error}")?;
+                        }
+                        libp2p::TransportError::Other(other_error) => {
+                            let inner_error = ClearDialError::most_inner_error(other_error);
+                            write!(f, "Transport error: {inner_error}")?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            DialError::LocalPeerId { .. } => write!(f, "The peer being dialed is the local peer."),
+            DialError::NoAddresses => write!(f, "No addresses for the peer to dial."),
+            DialError::DialPeerConditionFalse(_) => write!(f, "PeerCondition evaluation failed."),
+            DialError::Aborted => write!(f, "Connection aborted."),
+            DialError::WrongPeerId { .. } => write!(f, "Wrong peer id."),
+            DialError::Denied { cause } => write!(f, "Connection denied: {:?}", cause),
+        }
+    }
+}
+
 pub use crate::types::{
-    error, Enr, EnrSyncCommitteeBitfield, GossipTopic, NetworkGlobals, PubsubMessage, Subnet,
-    SubnetDiscovery,
+    Enr, EnrSyncCommitteeBitfield, GossipTopic, NetworkGlobals, PubsubMessage,
+    PubsubPartialMessage, Subnet, SubnetDiscovery, decode_partial,
 };
 
 pub use prometheus_client;
 
 pub use config::Config as NetworkConfig;
-pub use discovery::{CombinedKeyExt, EnrExt, Eth2Enr};
+pub use discovery::Eth2Enr;
 pub use discv5;
 pub use libp2p;
-pub use libp2p::bandwidth::BandwidthSinks;
 pub use libp2p::gossipsub::{IdentTopic, MessageAcceptance, MessageId, Topic, TopicHash};
-pub use libp2p::{core::ConnectedPoint, PeerId, Swarm};
-pub use libp2p::{multiaddr, Multiaddr};
-pub use metrics::scrape_discovery_metrics;
+pub use libp2p::{Multiaddr, identity, multiaddr};
+pub use libp2p::{PeerId, Swarm, core::ConnectedPoint};
 pub use peer_manager::{
+    ConnectionDirection, PeerConnectionStatus, PeerInfo, PeerManager, SyncInfo, SyncStatus,
+    peerdb::PeerDB,
     peerdb::client::Client,
     peerdb::score::{PeerAction, ReportSource},
-    peerdb::PeerDB,
-    ConnectionDirection, PeerConnectionStatus, PeerInfo, PeerManager, SyncInfo, SyncStatus,
 };
 // pub use service::{load_private_key, Context, Libp2pEvent, Service, NETWORK_KEY_FILENAME};
-pub use service::api_types::{PeerRequestId, Request, Response};
+pub use service::api_types::Response;
 pub use service::utils::*;
 pub use service::{Gossipsub, NetworkEvent};

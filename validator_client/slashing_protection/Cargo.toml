@@ -2,29 +2,32 @@
 name = "slashing_protection"
 version = "0.1.0"
 authors = ["Michael Sproul <michael@sigmaprime.io>", "pscott <scottpiriou@gmail.com>"]
-edition = "2021"
+edition = { workspace = true }
 autotests = false
+
+[features]
+arbitrary = ["dep:arbitrary", "types/arbitrary", "eip_3076/arbitrary"]
+portable = ["types/portable"]
+
+[dependencies]
+arbitrary = { workspace = true, features = ["derive"], optional = true }
+bls = { workspace = true }
+eip_3076 = { workspace = true, features = ["json"] }
+ethereum_serde_utils = { workspace = true }
+filesystem = { workspace = true }
+fixed_bytes = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_sqlite = "0.32"
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+types = { workspace = true, features = ["sqlite"] }
+
+[dev-dependencies]
+rayon = { workspace = true }
 
 [[test]]
 name = "slashing_protection_tests"
 path = "tests/main.rs"
-
-[dependencies]
-tempfile = "3.1.0"
-types = { path = "../../consensus/types" }
-rusqlite = { version = "0.25.3", features = ["bundled"] }
-r2d2 = "0.8.9"
-r2d2_sqlite = "0.18.0"
-serde = "1.0.116"
-serde_derive = "1.0.116"
-serde_json = "1.0.58"
-eth2_serde_utils = "0.1.1"
-filesystem = { path = "../../common/filesystem" }
-arbitrary = { version = "1.0", features = ["derive"], optional = true }
-
-[dev-dependencies]
-lazy_static = "1.4.0"
-rayon = "1.4.1"
-
-[features]
-arbitrary-fuzz = ["arbitrary", "types/arbitrary-fuzz"]

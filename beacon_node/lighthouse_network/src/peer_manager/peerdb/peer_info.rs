@@ -2,26 +2,27 @@ use super::client::Client;
 use super::score::{PeerAction, Score, ScoreState};
 use super::sync_status::SyncStatus;
 use crate::discovery::Eth2Enr;
-use crate::Multiaddr;
 use crate::{rpc::MetaData, types::Subnet};
+use PeerConnectionStatus::*;
 use discv5::Enr;
+use eth2::types::{PeerDirection, PeerState};
+use libp2p::core::multiaddr::{Multiaddr, Protocol};
 use serde::{
-    ser::{SerializeStruct, Serializer},
     Serialize,
+    ser::{SerializeStruct, Serializer},
 };
 use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::time::Instant;
 use strum::AsRefStr;
-use types::EthSpec;
-use PeerConnectionStatus::*;
+use types::{DataColumnSubnetId, EthSpec, Slot};
 
 /// Information about a given connected peer.
 #[derive(Clone, Debug, Serialize)]
-#[serde(bound = "T: EthSpec")]
-pub struct PeerInfo<T: EthSpec> {
+#[serde(bound = "E: EthSpec")]
+pub struct PeerInfo<E: EthSpec> {
     /// The peers reputation
-    score: Score,
+    pub(crate) score: Score,
     /// Client managing this peer
     client: Client,
     /// Connection status of this peer
@@ -29,23 +30,30 @@ pub struct PeerInfo<T: EthSpec> {
     /// The known listening addresses of this peer. This is given by identify and can be arbitrary
     /// (including local IPs).
     listening_addresses: Vec<Multiaddr>,
-    /// This is addresses we have physically seen and this is what we use for banning/un-banning
+    /// These are the multiaddrs we have physically seen and is what we use for banning/un-banning
     /// peers.
-    seen_addresses: HashSet<SocketAddr>,
+    seen_multiaddrs: HashSet<Multiaddr>,
     /// The current syncing state of the peer. The state may be determined after it's initial
     /// connection.
     sync_status: SyncStatus,
     /// The ENR subnet bitfield of the peer. This may be determined after it's initial
     /// connection.
-    meta_data: Option<MetaData<T>>,
+    meta_data: Option<MetaData<E>>,
     /// Subnets the peer is connected to.
     subnets: HashSet<Subnet>,
+    /// Subnets the peer is connected to, requesting partial messages.
+    partial_message_subnets: HashSet<Subnet>,
+    /// This is computed from either metadata or the ENR, and contains the subnets that the peer
+    /// is *assigned* to custody, rather than *connected* to (different to `self.subnets`).
+    /// Note: Another reason to keep this separate to `self.subnets` is an upcoming change to
+    /// decouple custody requirements from the actual subnets, i.e. changing this to `custody_groups`.
+    custody_subnets: HashSet<DataColumnSubnetId>,
     /// The time we would like to retain this peer. After this time, the peer is no longer
     /// necessary.
     #[serde(skip)]
     min_ttl: Option<Instant>,
     /// Is the peer a trusted peer.
-    is_trusted: bool,
+    pub(crate) is_trusted: bool,
     /// Direction of the first connection of the last (or current) connected session with this peer.
     /// None if this peer was never connected.
     connection_direction: Option<ConnectionDirection>,
@@ -53,15 +61,17 @@ pub struct PeerInfo<T: EthSpec> {
     enr: Option<Enr>,
 }
 
-impl<TSpec: EthSpec> Default for PeerInfo<TSpec> {
-    fn default() -> PeerInfo<TSpec> {
+impl<E: EthSpec> Default for PeerInfo<E> {
+    fn default() -> PeerInfo<E> {
         PeerInfo {
             score: Score::default(),
             client: Client::default(),
             connection_status: Default::default(),
             listening_addresses: Vec::new(),
-            seen_addresses: HashSet::new(),
+            seen_multiaddrs: HashSet::new(),
             subnets: HashSet::new(),
+            partial_message_subnets: HashSet::new(),
+            custody_subnets: HashSet::new(),
             sync_status: SyncStatus::Unknown,
             meta_data: None,
             min_ttl: None,
@@ -72,7 +82,7 @@ impl<TSpec: EthSpec> Default for PeerInfo<TSpec> {
     }
 }
 
-impl<T: EthSpec> PeerInfo<T> {
+impl<E: EthSpec> PeerInfo<E> {
     /// Return a PeerInfo struct for a trusted peer.
     pub fn trusted_peer_info() -> Self {
         PeerInfo {
@@ -83,16 +93,20 @@ impl<T: EthSpec> PeerInfo<T> {
     }
 
     /// Returns if the peer is subscribed to a given `Subnet` from the metadata attnets/syncnets field.
+    /// Also returns true if the peer is assigned to custody a given data column `Subnet` computed from the metadata `custody_group_count` field or ENR `cgc` field.
     pub fn on_subnet_metadata(&self, subnet: &Subnet) -> bool {
         if let Some(meta_data) = &self.meta_data {
             match subnet {
                 Subnet::Attestation(id) => {
-                    return meta_data.attnets().get(**id as usize).unwrap_or(false)
+                    return meta_data.attnets().get(**id as usize).unwrap_or(false);
                 }
                 Subnet::SyncCommittee(id) => {
                     return meta_data
                         .syncnets()
-                        .map_or(false, |s| s.get(**id as usize).unwrap_or(false))
+                        .is_ok_and(|s| s.get(**id as usize).unwrap_or(false));
+                }
+                Subnet::DataColumn(subnet_id) => {
+                    return self.is_assigned_to_custody_subnet(subnet_id);
                 }
             }
         }
@@ -114,13 +128,31 @@ impl<T: EthSpec> PeerInfo<T> {
         self.connection_direction.as_ref()
     }
 
+    /// Returns true if this is an incoming ipv4 connection.
+    pub fn is_incoming_ipv4_connection(&self) -> bool {
+        self.seen_multiaddrs.iter().any(|multiaddr| {
+            multiaddr
+                .iter()
+                .any(|protocol| matches!(protocol, libp2p::core::multiaddr::Protocol::Ip4(_)))
+        })
+    }
+
+    /// Returns true if this is an incoming ipv6 connection.
+    pub fn is_incoming_ipv6_connection(&self) -> bool {
+        self.seen_multiaddrs.iter().any(|multiaddr| {
+            multiaddr
+                .iter()
+                .any(|protocol| matches!(protocol, libp2p::core::multiaddr::Protocol::Ip6(_)))
+        })
+    }
+
     /// Returns the sync status of the peer.
     pub fn sync_status(&self) -> &SyncStatus {
         &self.sync_status
     }
 
     /// Returns the metadata for the peer if currently known.
-    pub fn meta_data(&self) -> Option<&MetaData<T>> {
+    pub fn meta_data(&self) -> Option<&MetaData<E>> {
         self.meta_data.as_ref()
     }
 
@@ -145,19 +177,6 @@ impl<T: EthSpec> PeerInfo<T> {
         self.subnets.iter()
     }
 
-    /// Returns the number of long lived subnets a peer is subscribed to.
-    // NOTE: This currently excludes sync committee subnets
-    pub fn long_lived_subnet_count(&self) -> usize {
-        if let Some(meta_data) = self.meta_data.as_ref() {
-            return meta_data.attnets().num_set_bits();
-        } else if let Some(enr) = self.enr.as_ref() {
-            if let Ok(attnets) = enr.attestation_bitfield::<T>() {
-                return attnets.num_set_bits();
-            }
-        }
-        0
-    }
-
     /// Returns an iterator over the long-lived subnets if it has any.
     pub fn long_lived_subnets(&self) -> Vec<Subnet> {
         let mut long_lived_subnets = Vec::new();
@@ -177,7 +196,7 @@ impl<T: EthSpec> PeerInfo<T> {
                 }
             }
         } else if let Some(enr) = self.enr.as_ref() {
-            if let Ok(attnets) = enr.attestation_bitfield::<T>() {
+            if let Ok(attnets) = enr.attestation_bitfield::<E>() {
                 for subnet in 0..=attnets.highest_set_bit().unwrap_or(0) {
                     if attnets.get(subnet).unwrap_or(false) {
                         long_lived_subnets.push(Subnet::Attestation((subnet as u64).into()));
@@ -185,7 +204,7 @@ impl<T: EthSpec> PeerInfo<T> {
                 }
             }
 
-            if let Ok(syncnets) = enr.sync_committee_bitfield::<T>() {
+            if let Ok(syncnets) = enr.sync_committee_bitfield::<E>() {
                 for subnet in 0..=syncnets.highest_set_bit().unwrap_or(0) {
                     if syncnets.get(subnet).unwrap_or(false) {
                         long_lived_subnets.push(Subnet::SyncCommittee((subnet as u64).into()));
@@ -193,12 +212,34 @@ impl<T: EthSpec> PeerInfo<T> {
                 }
             }
         }
+
+        long_lived_subnets.extend(
+            self.custody_subnets
+                .iter()
+                .map(|&id| Subnet::DataColumn(id)),
+        );
+
         long_lived_subnets
     }
 
     /// Returns if the peer is subscribed to a given `Subnet` from the gossipsub subscriptions.
     pub fn on_subnet_gossipsub(&self, subnet: &Subnet) -> bool {
         self.subnets.contains(subnet)
+    }
+
+    /// Returns if the peer is assigned to a given `DataColumnSubnetId`.
+    pub fn is_assigned_to_custody_subnet(&self, subnet: &DataColumnSubnetId) -> bool {
+        self.custody_subnets.contains(subnet)
+    }
+
+    /// Returns an iterator on this peer's custody subnets
+    pub fn custody_subnets_iter(&self) -> impl Iterator<Item = &DataColumnSubnetId> {
+        self.custody_subnets.iter()
+    }
+
+    /// Returns the number of custody subnets this peer is assigned to.
+    pub fn custody_subnet_count(&self) -> usize {
+        self.custody_subnets.len()
     }
 
     /// Returns true if the peer is connected to a long-lived subnet.
@@ -208,34 +249,51 @@ impl<T: EthSpec> PeerInfo<T> {
             if !meta_data.attnets().is_zero() && !self.subnets.is_empty() {
                 return true;
             }
-            if let Ok(sync) = meta_data.syncnets() {
-                if !sync.is_zero() {
-                    return true;
-                }
+            if let Ok(sync) = meta_data.syncnets()
+                && !sync.is_zero()
+            {
+                return true;
             }
         }
 
         // We may not have the metadata but may have an ENR. Lets check that
-        if let Some(enr) = self.enr.as_ref() {
-            if let Ok(attnets) = enr.attestation_bitfield::<T>() {
-                if !attnets.is_zero() && !self.subnets.is_empty() {
-                    return true;
-                }
-            }
+        if let Some(enr) = self.enr.as_ref()
+            && let Ok(attnets) = enr.attestation_bitfield::<E>()
+            && !attnets.is_zero()
+            && !self.subnets.is_empty()
+        {
+            return true;
         }
+
+        // Check if the peer has custody subnets populated and the peer is subscribed to any of
+        // its custody subnets
+        let subscribed_to_any_custody_subnets = self
+            .custody_subnets
+            .iter()
+            .any(|subnet_id| self.subnets.contains(&Subnet::DataColumn(*subnet_id)));
+        if subscribed_to_any_custody_subnets {
+            return true;
+        }
+
         false
     }
 
     /// Returns the seen addresses of the peer.
-    pub fn seen_addresses(&self) -> impl Iterator<Item = &SocketAddr> + '_ {
-        self.seen_addresses.iter()
+    pub fn seen_multiaddrs(&self) -> impl Iterator<Item = &Multiaddr> + '_ {
+        self.seen_multiaddrs.iter()
     }
 
     /// Returns a list of seen IP addresses for the peer.
     pub fn seen_ip_addresses(&self) -> impl Iterator<Item = IpAddr> + '_ {
-        self.seen_addresses
-            .iter()
-            .map(|socket_addr| socket_addr.ip())
+        self.seen_multiaddrs.iter().filter_map(|multiaddr| {
+            multiaddr.iter().find_map(|protocol| {
+                match protocol {
+                    Protocol::Ip4(ip) => Some(ip.into()),
+                    Protocol::Ip6(ip) => Some(ip.into()),
+                    _ => None, // Only care for IP addresses
+                }
+            })
+        })
     }
 
     /// Returns the connection status of the peer.
@@ -245,7 +303,7 @@ impl<T: EthSpec> PeerInfo<T> {
 
     /// Reports if this peer has some future validator duty in which case it is valuable to keep it.
     pub fn has_future_duty(&self) -> bool {
-        self.min_ttl.map_or(false, |i| i >= Instant::now())
+        self.min_ttl.is_some_and(|i| i >= Instant::now())
     }
 
     /// Returns score of the peer.
@@ -271,6 +329,22 @@ impl<T: EthSpec> PeerInfo<T> {
             self.connection_status,
             PeerConnectionStatus::Connected { .. }
         )
+    }
+
+    /// Checks if the peer is synced or advanced.
+    pub fn is_synced_or_advanced(&self) -> bool {
+        matches!(
+            self.sync_status,
+            SyncStatus::Synced { .. } | SyncStatus::Advanced { .. }
+        )
+    }
+
+    /// Checks if the peer is synced or advanced, and has data available for the given slot.
+    pub fn is_synced_or_advanced_with_available_slot(&self, slot: Slot) -> bool {
+        match &self.sync_status {
+            SyncStatus::Synced { info } | SyncStatus::Advanced { info } => info.has_slot(slot),
+            SyncStatus::IrrelevantPeer | SyncStatus::Behind { .. } | SyncStatus::Unknown => false,
+        }
     }
 
     /// Checks if the status is connected.
@@ -301,13 +375,13 @@ impl<T: EthSpec> PeerInfo<T> {
 
     /// Checks if the peer is outbound-only
     pub fn is_outbound_only(&self) -> bool {
-        matches!(self.connection_status, Connected {n_in, n_out} if n_in == 0 && n_out > 0)
+        matches!(self.connection_status, Connected {n_in, n_out, ..} if n_in == 0 && n_out > 0)
     }
 
     /// Returns the number of connections with this peer.
     pub fn connections(&self) -> (u8, u8) {
         match self.connection_status {
-            Connected { n_in, n_out } => (n_in, n_out),
+            Connected { n_in, n_out, .. } => (n_in, n_out),
             _ => (0, 0),
         }
     }
@@ -338,13 +412,20 @@ impl<T: EthSpec> PeerInfo<T> {
 
     /// Sets an explicit value for the meta data.
     // VISIBILITY: The peer manager is able to adjust the meta_data
-    pub(in crate::peer_manager) fn set_meta_data(&mut self, meta_data: MetaData<T>) {
-        self.meta_data = Some(meta_data)
+    pub(in crate::peer_manager) fn set_meta_data(&mut self, meta_data: MetaData<E>) {
+        self.meta_data = Some(meta_data);
     }
 
     /// Sets the connection status of the peer.
     pub(super) fn set_connection_status(&mut self, connection_status: PeerConnectionStatus) {
         self.connection_status = connection_status
+    }
+
+    pub(in crate::peer_manager) fn set_custody_subnets(
+        &mut self,
+        custody_subnets: HashSet<DataColumnSubnetId>,
+    ) {
+        self.custody_subnets = custody_subnets
     }
 
     /// Sets the ENR of the peer if one is known.
@@ -358,18 +439,23 @@ impl<T: EthSpec> PeerInfo<T> {
     }
 
     /// Adds a known subnet for the peer.
-    pub(super) fn insert_subnet(&mut self, subnet: Subnet) {
+    pub(super) fn insert_subnet(&mut self, subnet: Subnet, supports_partials: bool) {
         self.subnets.insert(subnet);
+        if supports_partials {
+            self.partial_message_subnets.insert(subnet);
+        }
     }
 
     /// Removes a subnet from the peer.
     pub(super) fn remove_subnet(&mut self, subnet: &Subnet) {
         self.subnets.remove(subnet);
+        self.partial_message_subnets.remove(subnet);
     }
 
     /// Removes all subnets from the peer.
     pub(super) fn clear_subnets(&mut self) {
-        self.subnets.clear()
+        self.subnets.clear();
+        self.partial_message_subnets.clear()
     }
 
     /// Applies decay rates to a non-trusted peer's score.
@@ -415,7 +501,9 @@ impl<T: EthSpec> PeerInfo<T> {
 
     /// Modifies the status to Connected and increases the number of ingoing
     /// connections by one
-    pub(super) fn connect_ingoing(&mut self, seen_address: Option<SocketAddr>) {
+    pub(super) fn connect_ingoing(&mut self, multiaddr: Multiaddr) {
+        self.seen_multiaddrs.insert(multiaddr.clone());
+
         match &mut self.connection_status {
             Connected { n_in, .. } => *n_in += 1,
             Disconnected { .. }
@@ -423,19 +511,20 @@ impl<T: EthSpec> PeerInfo<T> {
             | Dialing { .. }
             | Disconnecting { .. }
             | Unknown => {
-                self.connection_status = Connected { n_in: 1, n_out: 0 };
+                self.connection_status = Connected {
+                    n_in: 1,
+                    n_out: 0,
+                    multiaddr,
+                };
                 self.connection_direction = Some(ConnectionDirection::Incoming);
             }
-        }
-
-        if let Some(socket_addr) = seen_address {
-            self.seen_addresses.insert(socket_addr);
         }
     }
 
     /// Modifies the status to Connected and increases the number of outgoing
     /// connections by one
-    pub(super) fn connect_outgoing(&mut self, seen_address: Option<SocketAddr>) {
+    pub(super) fn connect_outgoing(&mut self, multiaddr: Multiaddr) {
+        self.seen_multiaddrs.insert(multiaddr.clone());
         match &mut self.connection_status {
             Connected { n_out, .. } => *n_out += 1,
             Disconnected { .. }
@@ -443,12 +532,13 @@ impl<T: EthSpec> PeerInfo<T> {
             | Dialing { .. }
             | Disconnecting { .. }
             | Unknown => {
-                self.connection_status = Connected { n_in: 0, n_out: 1 };
+                self.connection_status = Connected {
+                    n_in: 0,
+                    n_out: 1,
+                    multiaddr,
+                };
                 self.connection_direction = Some(ConnectionDirection::Outgoing);
             }
-        }
-        if let Some(ip_addr) = seen_address {
-            self.seen_addresses.insert(ip_addr);
         }
     }
 
@@ -467,7 +557,7 @@ impl<T: EthSpec> PeerInfo<T> {
 }
 
 /// Connection Direction of connection.
-#[derive(Debug, Clone, Serialize, AsRefStr)]
+#[derive(Debug, Clone, Copy, Serialize, AsRefStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum ConnectionDirection {
     /// The connection was established by a peer dialing us.
@@ -476,11 +566,22 @@ pub enum ConnectionDirection {
     Outgoing,
 }
 
+impl From<ConnectionDirection> for PeerDirection {
+    fn from(direction: ConnectionDirection) -> Self {
+        match direction {
+            ConnectionDirection::Incoming => PeerDirection::Inbound,
+            ConnectionDirection::Outgoing => PeerDirection::Outbound,
+        }
+    }
+}
+
 /// Connection Status of the peer.
 #[derive(Debug, Clone, Default)]
 pub enum PeerConnectionStatus {
     /// The peer is connected.
     Connected {
+        /// The multiaddr that we are connected via.
+        multiaddr: Multiaddr,
         /// number of ingoing connections.
         n_in: u8,
         /// number of outgoing connections.
@@ -516,7 +617,12 @@ impl Serialize for PeerConnectionStatus {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut s = serializer.serialize_struct("connection_status", 6)?;
         match self {
-            Connected { n_in, n_out } => {
+            Connected {
+                n_in,
+                n_out,
+                multiaddr,
+            } => {
+                s.serialize_field("multiaddr", multiaddr)?;
                 s.serialize_field("status", "connected")?;
                 s.serialize_field("connections_in", n_in)?;
                 s.serialize_field("connections_out", n_out)?;
@@ -560,5 +666,63 @@ impl Serialize for PeerConnectionStatus {
                 s.end()
             }
         }
+    }
+}
+
+impl From<PeerConnectionStatus> for PeerState {
+    fn from(status: PeerConnectionStatus) -> Self {
+        match status {
+            Connected { .. } => PeerState::Connected,
+            Dialing { .. } => PeerState::Connecting,
+            Disconnecting { .. } => PeerState::Disconnecting,
+            Disconnected { .. } | Banned { .. } | Unknown => PeerState::Disconnected,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Subnet;
+    use types::{DataColumnSubnetId, MainnetEthSpec};
+
+    type E = MainnetEthSpec;
+
+    fn create_test_peer_info() -> PeerInfo<E> {
+        PeerInfo::default()
+    }
+
+    #[test]
+    fn test_has_long_lived_subnet_empty_custody_subnets() {
+        let peer_info = create_test_peer_info();
+        // peer has no custody subnets or subscribed to any subnets hence return false
+        assert!(!peer_info.has_long_lived_subnet());
+    }
+
+    #[test]
+    fn test_has_long_lived_subnet_empty_subnets_with_custody_subnets() {
+        let mut peer_info = create_test_peer_info();
+        peer_info.custody_subnets.insert(DataColumnSubnetId::new(1));
+        peer_info.custody_subnets.insert(DataColumnSubnetId::new(2));
+        // Peer has custody subnets but isn't subscribed to any hence return false
+        assert!(!peer_info.has_long_lived_subnet());
+    }
+
+    #[test]
+    fn test_has_long_lived_subnet_subscribed_to_custody_subnets() {
+        let mut peer_info = create_test_peer_info();
+        peer_info.custody_subnets.insert(DataColumnSubnetId::new(1));
+        peer_info.custody_subnets.insert(DataColumnSubnetId::new(2));
+        peer_info.custody_subnets.insert(DataColumnSubnetId::new(3));
+
+        peer_info
+            .subnets
+            .insert(Subnet::DataColumn(DataColumnSubnetId::new(1)));
+        peer_info
+            .subnets
+            .insert(Subnet::DataColumn(DataColumnSubnetId::new(2)));
+        // Missing DataColumnSubnetId::new(3) - but peer is subscribed to some custody subnets
+        // Peer is subscribed to any custody subnets - return true
+        assert!(peer_info.has_long_lived_subnet());
     }
 }

@@ -1,33 +1,34 @@
 //! Provides a JSON keystore for a BLS keypair, as specified by
 //! [EIP-2335](https://eips.ethereum.org/EIPS/eip-2335).
 
+use crate::Uuid;
 use crate::derived_key::DerivedKey;
 use crate::json_keystore::{
     Aes128Ctr, ChecksumModule, Cipher, CipherModule, Crypto, EmptyMap, EmptyString, JsonKeystore,
     Kdf, KdfModule, Scrypt, Sha256Checksum, Version,
 };
-use crate::Uuid;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{NewCipher, StreamCipher};
-use aes::Aes128Ctr as AesCtr;
+use aes::Aes128;
 use bls::{Keypair, PublicKey, SecretKey, ZeroizeHash};
+use cipher::generic_array::GenericArray;
+use cipher::{KeyIvInit, StreamCipher};
+use ctr::Ctr64BE;
 use eth2_key_derivation::PlainText;
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
 use rand::prelude::*;
 use scrypt::{
+    Params as ScryptParams,
     errors::{InvalidOutputLen, InvalidParams},
-    scrypt, Params as ScryptParams,
+    scrypt,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::iter::FromIterator;
 use std::path::Path;
 use std::str;
 use unicode_normalization::UnicodeNormalization;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 /// The byte-length of a BLS secret key.
 const SECRET_KEY_LEN: usize = 32;
@@ -60,45 +61,6 @@ pub const IV_SIZE: usize = 16;
 pub const HASH_SIZE: usize = 32;
 /// The default iteraction count, `c`, for PBKDF2.
 pub const DEFAULT_PBKDF2_C: u32 = 262_144;
-
-/// Provides a new-type wrapper around `String` that is zeroized on `Drop`.
-///
-/// Useful for ensuring that password memory is zeroed-out on drop.
-#[derive(Clone, PartialEq, Serialize, Deserialize, Zeroize)]
-#[zeroize(drop)]
-#[serde(transparent)]
-struct ZeroizeString(String);
-
-impl From<String> for ZeroizeString {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl AsRef<[u8]> for ZeroizeString {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-}
-
-impl std::ops::Deref for ZeroizeString {
-    type Target = String;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for ZeroizeString {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl FromIterator<char> for ZeroizeString {
-    fn from_iter<T: IntoIterator<Item = char>>(iter: T) -> Self {
-        ZeroizeString(String::from_iter(iter))
-    }
-}
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -143,8 +105,8 @@ impl<'a> KeystoreBuilder<'a> {
         if password.is_empty() {
             Err(Error::EmptyPassword)
         } else {
-            let salt = rand::thread_rng().gen::<[u8; SALT_SIZE]>();
-            let iv = rand::thread_rng().gen::<[u8; IV_SIZE]>().to_vec().into();
+            let salt = rand::rng().random::<[u8; SALT_SIZE]>();
+            let iv = rand::rng().random::<[u8; IV_SIZE]>().to_vec().into();
 
             Ok(Self {
                 keypair,
@@ -299,7 +261,7 @@ impl Keystore {
 
     /// Returns the pubkey for the keystore, parsed as a `PublicKey` if it parses.
     pub fn public_key(&self) -> Option<PublicKey> {
-        serde_json::from_str(&format!("\"0x{}\"", &self.json.pubkey)).ok()
+        serde_json::from_str(&format!("\"0x{}\"", self.json.pubkey)).ok()
     }
 
     /// Returns the key derivation function for the keystore.
@@ -389,7 +351,7 @@ pub fn encrypt(
             // AES Encrypt
             let key = GenericArray::from_slice(&derived_key.as_bytes()[0..16]);
             let nonce = GenericArray::from_slice(params.iv.as_bytes());
-            let mut cipher = AesCtr::new(key, nonce);
+            let mut cipher = Ctr64BE::<Aes128>::new(key, nonce);
             cipher.apply_keystream(&mut cipher_text);
         }
     };
@@ -435,7 +397,7 @@ pub fn decrypt(password: &[u8], crypto: &Crypto) -> Result<PlainText, Error> {
             // AES Decrypt
             let key = GenericArray::from_slice(&derived_key.as_bytes()[0..16]);
             let nonce = GenericArray::from_slice(params.iv.as_bytes());
-            let mut cipher = AesCtr::new(key, nonce);
+            let mut cipher = Ctr64BE::<Aes128>::new(key, nonce);
             cipher.apply_keystream(plain_text.as_mut_bytes());
         }
     };
@@ -452,11 +414,12 @@ fn is_control_character(c: char) -> bool {
 /// Takes a slice of bytes and returns a NFKD normalized string representation.
 ///
 /// Returns an error if the bytes are not valid utf8.
-fn normalize(bytes: &[u8]) -> Result<ZeroizeString, Error> {
+fn normalize(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
     Ok(str::from_utf8(bytes)
         .map_err(|_| Error::InvalidPasswordBytes)?
         .nfkd()
-        .collect::<ZeroizeString>())
+        .collect::<String>()
+        .into())
 }
 
 /// Generates a checksum to indicate that the `derived_key` is associated with the
@@ -482,13 +445,15 @@ fn derive_key(password: &[u8], kdf: &Kdf) -> Result<DerivedKey, Error> {
                 params.salt.as_bytes(),
                 params.c,
                 dk.as_mut_bytes(),
-            );
+            )
+            // `pbkdf2` accepts keys of any size so this error should never occur in practice.
+            .map_err(|_| Error::InvalidPassword)?;
         }
         Kdf::Scrypt(params) => {
             scrypt(
                 password,
                 params.salt.as_bytes(),
-                &ScryptParams::new(log2_int(params.n) as u8, params.r, params.p)
+                &ScryptParams::new(log2_int(params.n) as u8, params.r, params.p, DKLEN as usize)
                     .map_err(Error::ScryptInvalidParams)?,
                 dk.as_mut_bytes(),
             )
@@ -613,7 +578,10 @@ fn validate_parameters(kdf: &Kdf) -> Result<(), Error> {
             let default_kdf = Scrypt::default_scrypt(vec![0u8; 32]);
             let default_npr = 128 * default_kdf.n * default_kdf.p * default_kdf.r;
             if npr < default_npr {
-                eprintln!("WARN: Scrypt parameters are too weak (n: {}, p: {}, r: {}), we recommend (n: {}, p: {}, r: {})", params.n, params.p, params.r, default_kdf.n, default_kdf.p, default_kdf.r);
+                eprintln!(
+                    "WARN: Scrypt parameters are too weak (n: {}, p: {}, r: {}), we recommend (n: {}, p: {}, r: {})",
+                    params.n, params.p, params.r, default_kdf.n, default_kdf.p, default_kdf.r
+                );
             }
 
             // Validate `salt` length.

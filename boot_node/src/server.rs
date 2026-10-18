@@ -1,67 +1,98 @@
 //! The main bootnode server execution.
 
 use super::BootNodeConfig;
+use crate::config::BootNodeConfigSerialization;
+use clap::ArgMatches;
+use eth2_network_config::Eth2NetworkConfig;
 use lighthouse_network::{
-    discv5::{enr::NodeId, Discv5, Discv5Event},
-    EnrExt, Eth2Enr,
+    Eth2Enr,
+    discv5::{self, Discv5, enr::NodeId},
 };
-use slog::info;
+use network_utils::enr_ext::EnrExt;
+use tracing::{info, warn};
 use types::EthSpec;
 
-pub async fn run<T: EthSpec>(config: BootNodeConfig<T>, log: slog::Logger) {
+pub async fn run<E: EthSpec>(
+    lh_matches: &ArgMatches,
+    bn_matches: &ArgMatches,
+    eth2_network_config: &Eth2NetworkConfig,
+) -> Result<(), String> {
+    // parse the CLI args into a useable config
+    let config: BootNodeConfig<E> = BootNodeConfig::new(bn_matches, eth2_network_config).await?;
+
+    // Dump configs if `dump-config` or `dump-chain-config` flags are set
+    let config_sz = BootNodeConfigSerialization::from_config_ref(&config);
+    clap_utils::check_dump_configs::<_, E>(
+        lh_matches,
+        &config_sz,
+        &eth2_network_config.chain_spec::<E>()?,
+    )?;
+
+    if lh_matches.get_flag("immediate-shutdown") {
+        return Ok(());
+    }
+
+    let BootNodeConfig {
+        boot_nodes,
+        local_enr,
+        local_key,
+        discv5_config,
+        ..
+    } = config;
+
     // Print out useful information about the generated ENR
 
-    let enr_socket = config
-        .local_enr
-        .udp4_socket()
-        .expect("Enr has a UDP socket");
-    let eth2_field = config
-        .local_enr
+    let enr_v4_socket = local_enr.udp4_socket();
+    let enr_v6_socket = local_enr.udp6_socket();
+    let eth2_field = local_enr
         .eth2()
         .map(|fork_id| hex::encode(fork_id.fork_digest))
         .unwrap_or_default();
 
-    info!(log, "Configuration parameters"; "listening_address" => format!("{}:{}", config.listen_socket.ip(), config.listen_socket.port()), "broadcast_address" => format!("{}:{}",enr_socket.ip(), enr_socket.port()), "eth2" => eth2_field);
+    let pretty_v4_socket = enr_v4_socket.as_ref().map(|addr| addr.to_string());
+    let pretty_v6_socket = enr_v6_socket.as_ref().map(|addr| addr.to_string());
+    info!(
+        listening_address = ?discv5_config.listen_config,
+        advertised_v4_address = ?pretty_v4_socket,
+        advertised_v6_address = ?pretty_v6_socket,
+        eth2 = eth2_field,
+        "Configuration parameters"
+    );
 
-    info!(log, "Identity established"; "peer_id" => config.local_enr.peer_id().to_string(), "node_id" => config.local_enr.node_id().to_string());
+    info!(peer_id = %local_enr.peer_id(), node_id = %local_enr.node_id(), "Identity established");
 
     // build the contactable multiaddr list, adding the p2p protocol
-    info!(log, "Contact information"; "enr" => config.local_enr.to_base64());
-    info!(log, "Contact information"; "multiaddrs" => format!("{:?}", config.local_enr.multiaddr_p2p()));
+    info!(enr = local_enr.to_base64(), "Contact information");
+    info!(enr = ?local_enr, "Enr details");
+    info!(multiaddrs = ?local_enr.multiaddr_p2p(), "Contact information");
 
     // construct the discv5 server
-    let mut discv5 = Discv5::new(
-        config.local_enr.clone(),
-        config.local_key,
-        config.discv5_config,
-    )
-    .unwrap();
+    let mut discv5: Discv5 = Discv5::new(local_enr.clone(), local_key, discv5_config).unwrap();
 
     // If there are any bootnodes add them to the routing table
-    for enr in config.boot_nodes {
+    for enr in boot_nodes {
         info!(
-            log,
-            "Adding bootnode";
-            "address" => ?enr.udp4_socket(),
-            "peer_id" => enr.peer_id().to_string(),
-            "node_id" => enr.node_id().to_string()
+            ipv4_address = ?enr.udp4_socket(),
+            ipv6_address = ?enr.udp6_socket(),
+            peer_id = ?enr.peer_id(),
+            node_id = ?enr.node_id(),
+            "Adding bootnode"
         );
-        if enr != config.local_enr {
-            if let Err(e) = discv5.add_enr(enr) {
-                slog::warn!(log, "Failed adding ENR"; "error" => e.to_string());
-            }
+        if enr != local_enr
+            && let Err(e) = discv5.add_enr(enr)
+        {
+            warn!(error = ?e, "Failed adding ENR");
         }
     }
 
     // start the server
-    if let Err(e) = discv5.start(config.listen_socket).await {
-        slog::crit!(log, "Could not start discv5 server"; "error" => e.to_string());
-        return;
+    if let Err(e) = discv5.start().await {
+        return Err(format!("Could not start discv5 server: {e:?}"));
     }
 
     // if there are peers in the local routing table, establish a session by running a query
     if !discv5.table_entries_id().is_empty() {
-        info!(log, "Executing bootstrap query...");
+        info!("Executing bootstrap query...");
         let _ = discv5.find_node(NodeId::random()).await;
     }
 
@@ -72,8 +103,7 @@ pub async fn run<T: EthSpec>(config: BootNodeConfig<T>, log: slog::Logger) {
     let mut event_stream = match discv5.event_stream().await {
         Ok(stream) => stream,
         Err(e) => {
-            slog::crit!(log, "Failed to obtain event stream"; "error" => e.to_string());
-            return;
+            return Err(format!("Failed to obtain event stream: {e:?}"));
         }
     };
 
@@ -81,23 +111,46 @@ pub async fn run<T: EthSpec>(config: BootNodeConfig<T>, log: slog::Logger) {
     loop {
         tokio::select! {
             _ = metric_interval.tick() => {
+                // Get some ipv4/ipv6 stats to add in the metrics.
+                let mut ipv4_only_reachable: usize = 0;
+                let mut ipv6_only_reachable: usize= 0;
+                let mut ipv4_ipv6_reachable: usize = 0;
+                let mut unreachable_nodes: usize = 0;
+                for enr in discv5.kbuckets().iter_ref().filter_map(|entry| entry.status.is_connected().then_some(entry.node.value)) {
+                    let declares_ipv4 = enr.udp4_socket().is_some();
+                    let declares_ipv6 = enr.udp6_socket().is_some();
+                    match (declares_ipv4, declares_ipv6) {
+                        (true, true) => ipv4_ipv6_reachable += 1,
+                        (true, false) => ipv4_only_reachable += 1,
+                        (false, true) => ipv6_only_reachable += 1,
+                        (false, false) => unreachable_nodes += 1,
+                    }
+                }
+
                 // display server metrics
-                let metrics = discv5.metrics();
-                info!(log, "Server metrics"; "connected_peers" => discv5.connected_peers(), "active_sessions" => metrics.active_sessions, "requests/s" => format!("{:.2}", metrics.unsolicited_requests_per_second));
+                let metrics = Discv5::metrics();
+                info!(
+                    connected_peers = discv5.connected_peers(),
+                    active_sessions = metrics.active_sessions,
+                    "requests/s" = format_args!("{:.2}", metrics.unsolicited_requests_per_second),
+                    ipv4_nodes = ipv4_only_reachable,
+                    ipv6_only_nodes = ipv6_only_reachable,
+                    dual_stack_nodes = ipv4_ipv6_reachable,
+                    unreachable_nodes,
+                    "Server metrics",
+                );
+
             }
             Some(event) = event_stream.recv() => {
                 match event {
-                    Discv5Event::Discovered(_enr) => {
-                        // An ENR has bee obtained by the server
+                    discv5::Event::Discovered(_enr) => {
+                        // An ENR has been obtained by the server
                         // Ignore these events here
                     }
-                    Discv5Event::EnrAdded { .. } => {}     // Ignore
-                    Discv5Event::TalkRequest(_) => {}     // Ignore
-                    Discv5Event::NodeInserted { .. } => {} // Ignore
-                    Discv5Event::SocketUpdated(socket_addr) => {
-                        info!(log, "External socket address updated"; "socket_addr" => format!("{:?}", socket_addr));
+                    discv5::Event::SocketUpdated(socket_addr) => {
+                        info!(%socket_addr, "Advertised socket address updated");
                     }
-                    Discv5Event::SessionEstablished{ .. } => {} // Ignore
+                    _ => {} // Ignore
                 }
             }
         }
